@@ -64,6 +64,8 @@ struct stream_callback_entry
         STREAM_CALLBACK_EXECUTED
     } status;
     void (WINAPI *callback)(CUstream hStream, CUresult status, void *userData);
+    /* Set instead of callback for cuLaunchHostFunc. */
+    void (WINAPI *hostfn)(void *userData);
     struct
     {
         CUstream stream;
@@ -2899,10 +2901,19 @@ static DWORD WINAPI stream_callback_worker_thread(LPVOID parameter)
                 case STREAM_CALLBACK_PENDING:
                     pthread_mutex_unlock(&stream_callback_mutex);
 
-                    TRACE("calling stream callback %p(%p, %d, %p)\n", wrapper->callback,
-                          wrapper->args.stream, wrapper->args.status, wrapper->args.userdata);
-                    wrapper->callback(wrapper->args.stream, wrapper->args.status, wrapper->args.userdata);
-                    TRACE("stream callback %p returned\n", wrapper->callback);
+                    if (wrapper->hostfn)
+                    {
+                        TRACE("calling host function %p(%p)\n", wrapper->hostfn, wrapper->args.userdata);
+                        wrapper->hostfn(wrapper->args.userdata);
+                        TRACE("host function %p returned\n", wrapper->hostfn);
+                    }
+                    else
+                    {
+                        TRACE("calling stream callback %p(%p, %d, %p)\n", wrapper->callback,
+                              wrapper->args.stream, wrapper->args.status, wrapper->args.userdata);
+                        wrapper->callback(wrapper->args.stream, wrapper->args.status, wrapper->args.userdata);
+                        TRACE("stream callback %p returned\n", wrapper->callback);
+                    }
 
                     wrapper->status = STREAM_CALLBACK_EXECUTED;
                     pthread_cond_broadcast(&stream_callback_reply);
@@ -2925,12 +2936,11 @@ end:
     return 0;
 }
 
-static void stream_callback_wrapper(CUstream hStream, CUresult status, void *userData)
+/* Runs on a thread of the Linux driver, which has no Wine thread state, so the Windows callback
+ * runs on the worker thread instead and this waits for it. */
+static void run_on_callback_worker(struct stream_callback_entry *wrapper)
 {
-    struct stream_callback_entry *wrapper = userData;
-    wrapper->status         = STREAM_CALLBACK_PENDING;
-    wrapper->args.stream    = hStream;
-    wrapper->args.status    = status;
+    wrapper->status = STREAM_CALLBACK_PENDING;
     pthread_mutex_lock(&stream_callback_mutex);
 
     list_add_tail(&stream_callbacks, &wrapper->entry);
@@ -2942,17 +2952,26 @@ static void stream_callback_wrapper(CUstream hStream, CUresult status, void *use
     free(wrapper);
 }
 
-static CUresult stream_add_callback(CUresult (*func)(CUstream, void *, void *, unsigned int),
-                                    CUstream hStream, void *callback, void *userData, unsigned int flags)
+static void stream_callback_wrapper(CUstream hStream, CUresult status, void *userData)
 {
-    struct stream_callback_entry *wrapper;
-    CUresult ret;
+    struct stream_callback_entry *wrapper = userData;
+    wrapper->args.stream = hStream;
+    wrapper->args.status = status;
+    run_on_callback_worker(wrapper);
+}
 
-    wrapper = malloc(sizeof(*wrapper));
-    if (!wrapper)
-        return CUDA_ERROR_OUT_OF_MEMORY;
-    wrapper->callback       = callback;
-    wrapper->args.userdata  = userData;
+static void host_fn_wrapper(void *userData)
+{
+    run_on_callback_worker(userData);
+}
+
+/* Queues one callback for the worker thread, starting the thread if none runs. launch hands the
+ * wrapper to the driver and returns its result. */
+static CUresult queue_callback(struct stream_callback_entry *wrapper,
+                               CUresult (*launch)(struct stream_callback_entry *wrapper, void *context),
+                               void *context)
+{
+    CUresult ret;
 
     /* spawn a new worker thread if necessary */
     pthread_mutex_lock(&stream_callback_mutex);
@@ -2970,7 +2989,7 @@ static CUresult stream_add_callback(CUresult (*func)(CUstream, void *, void *, u
     }
     pthread_mutex_unlock(&stream_callback_mutex);
 
-    ret = func(hStream, stream_callback_wrapper, wrapper, flags);
+    ret = launch(wrapper, context);
     if (ret)
     {
         pthread_mutex_lock(&stream_callback_mutex);
@@ -2987,6 +3006,63 @@ static CUresult stream_add_callback(CUresult (*func)(CUstream, void *, void *, u
     }
 
     return ret;
+}
+
+struct stream_add_callback_args
+{
+    CUresult (*func)(CUstream, void *, void *, unsigned int);
+    CUstream stream;
+    unsigned int flags;
+};
+
+static CUresult launch_stream_callback(struct stream_callback_entry *wrapper, void *context)
+{
+    struct stream_add_callback_args *args = context;
+    return args->func(args->stream, stream_callback_wrapper, wrapper, args->flags);
+}
+
+static CUresult stream_add_callback(CUresult (*func)(CUstream, void *, void *, unsigned int),
+                                    CUstream hStream, void *callback, void *userData, unsigned int flags)
+{
+    struct stream_add_callback_args args = { func, hStream, flags };
+    struct stream_callback_entry *wrapper;
+
+    wrapper = calloc(1, sizeof(*wrapper));
+    if (!wrapper)
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    wrapper->callback       = callback;
+    wrapper->args.userdata  = userData;
+    return queue_callback(wrapper, launch_stream_callback, &args);
+}
+
+struct launch_host_func_args
+{
+    CUresult (*func)(CUstream, CUhostFn, void *);
+    CUresult (*func_v2)(CUstream, CUhostFn, void *, unsigned int);
+    CUstream stream;
+    unsigned int sync_mode;
+};
+
+static CUresult launch_host_fn(struct stream_callback_entry *wrapper, void *context)
+{
+    struct launch_host_func_args *args = context;
+    if (args->func_v2)
+        return args->func_v2(args->stream, host_fn_wrapper, wrapper, args->sync_mode);
+    return args->func(args->stream, host_fn_wrapper, wrapper);
+}
+
+/* The driver calls a host function on a thread of its own, so the Windows function goes through
+ * the callback worker, as for cuStreamAddCallback. */
+static CUresult launch_host_func(struct launch_host_func_args *args, void *fn, void *userData)
+{
+    struct stream_callback_entry *wrapper;
+
+    wrapper = calloc(1, sizeof(*wrapper));
+    if (!wrapper)
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    wrapper->hostfn         = fn;
+    wrapper->args.userdata  = userData;
+    return queue_callback(wrapper, launch_host_fn, args);
 }
 
 CUresult WINAPI wine_cuStreamAddCallback(CUstream hStream, void *callback, void *userData, unsigned int flags)
@@ -4123,14 +4199,16 @@ CUresult WINAPI wine_cuMemGetAllocationGranularity(size_t *granularity, const CU
 
 CUresult WINAPI wine_cuLaunchHostFunc(CUstream hStream, CUhostFn fn, void *userData)
 {
+    struct launch_host_func_args args = { pcuLaunchHostFunc, NULL, hStream, 0 };
     TRACE("(%p, %p, %p)\n", hStream, fn, userData);
-    return pcuLaunchHostFunc(hStream, fn, userData);
+    return launch_host_func(&args, fn, userData);
 }
 
 CUresult WINAPI wine_cuLaunchHostFunc_ptsz(CUstream hStream, CUhostFn fn, void *userData)
 {
+    struct launch_host_func_args args = { pcuLaunchHostFunc_ptsz, NULL, hStream, 0 };
     TRACE("(%p, %p, %p)\n", hStream, fn, userData);
-    return pcuLaunchHostFunc_ptsz(hStream, fn, userData);
+    return launch_host_func(&args, fn, userData);
 }
 
 CUresult WINAPI wine_cuImportExternalMemory(void *extMem_out, const CUDA_EXTERNAL_MEMORY_HANDLE_DESC *memHandleDesc)
@@ -6304,15 +6382,17 @@ CUresult WINAPI wine_cuCoredumpDeregisterCompleteCallback(CUcoredumpCallbackHand
 CUresult WINAPI wine_cuLaunchHostFunc_v2(CUstream hStream, CUhostFn fn, void* userData, unsigned int syncMode)
 {
     TRACE("(%p, %p, %p, %u)\n", hStream, fn, userData, syncMode);
+    struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2, hStream, syncMode };
     CHECK_FUNCPTR(cuLaunchHostFunc_v2);
-    return pcuLaunchHostFunc_v2(hStream, fn, userData, syncMode);
+    return launch_host_func(&args, fn, userData);
 }
 
 CUresult WINAPI wine_cuLaunchHostFunc_v2_ptsz(CUstream hStream, CUhostFn fn, void* userData, unsigned int syncMode)
 {
     TRACE("(%p, %p, %p, %u)\n", hStream, fn, userData, syncMode);
+    struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2_ptsz, hStream, syncMode };
     CHECK_FUNCPTR(cuLaunchHostFunc_v2_ptsz);
-    return pcuLaunchHostFunc_v2_ptsz(hStream, fn, userData, syncMode);
+    return launch_host_func(&args, fn, userData);
 }
 
 CUresult WINAPI wine_cuLogicalEndpointIdReserve(CUlogicalEndpointId* leId, cuuint32_t count)
