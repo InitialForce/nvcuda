@@ -33,6 +33,7 @@
 #include "winternl.h"
 #include "wine/debug.h"
 #include "wine/list.h"
+#include "wine/rbtree.h"
 #include "wine/wgl.h"
 #include "cuda.h"
 #include "nvcuda.h"
@@ -51,6 +52,8 @@ static pthread_cond_t  stream_callback_reply         = PTHREAD_COND_INITIALIZER;
 static const char      devpropkey_gpu_vulkan_uuidA[] = "Properties\\{233A9EF3-AFC4-4ABD-B564-C32F21F1535C}\\0002";
 static const char      devpropkey_gpu_luidA[]        = "Properties\\{60B193CB-5276-4D0F-96FC-F173ABAD3EC6}\\0002";
 static LONG            num_stream_callbacks;
+/* Host node wrappers owned by graphs, for traces. */
+static int             num_host_node_wrappers;
 
 static void get_addr(const char* symbol, int driverVersion, size_t flags, void** pfn);
 
@@ -2883,6 +2886,8 @@ static DWORD WINAPI stream_callback_worker_thread(LPVOID parameter)
 {
     struct stream_callback_entry *wrapper;
     struct list *ptr;
+
+    TRACE("callback worker starts\n");
     pthread_mutex_lock(&stream_callback_mutex);
 
     for (;;)
@@ -2933,6 +2938,8 @@ static DWORD WINAPI stream_callback_worker_thread(LPVOID parameter)
 
 end:
     pthread_mutex_unlock(&stream_callback_mutex);
+    TRACE("callback worker ends, %d host node wrappers live\n",
+          __atomic_load_n(&num_host_node_wrappers, __ATOMIC_RELAXED));
     return 0;
 }
 
@@ -3044,6 +3051,7 @@ static void host_node_wrapper(void *userData)
  * thread of its own once no graph holds the wrapper. */
 static void host_node_destroy(void *userData)
 {
+    __atomic_sub_fetch(&num_host_node_wrappers, 1, __ATOMIC_RELAXED);
     abandon_callback(userData);
 }
 
@@ -3104,74 +3112,215 @@ C_ASSERT(sizeof(struct graph_node_params) == 256);
 #define CU_USER_OBJECT_NO_DESTRUCTOR_SYNC   1
 #define CU_GRAPH_USER_OBJECT_MOVE           1
 
-/* Puts host_node_wrapper into params in place of the Windows function. With a graph, the wrapper
- * gets a user object in *object, which finish_host_params hands to the graph. Without one, as for
- * an executable graph, the wrapper is never freed. */
-static CUresult wrap_host_params(CUgraph graph, struct host_node_params *params, void **object)
+/* The host node wrapper and user object that each node of a graph owns, so that replacing the
+ * parameters or destroying the node gives the graph's reference back instead of keeping the old
+ * wrapper until the graph is destroyed. Clones and executable graphs hold references of their own,
+ * so they are not affected. A node added by stream capture without a handle the bridge can learn
+ * is not tracked, and its first wrapper stays until the graph is destroyed. */
+struct host_node_owner
 {
-    struct stream_callback_entry *node;
+    struct rb_entry entry;
+    CUgraphNode node;
+    CUgraph graph;
+    void *object;
+    struct stream_callback_entry *wrapper;
+    struct host_node_owner *next; /* for remove_graph_host_nodes */
+};
+
+static int host_node_owner_compare(const void *key, const struct rb_entry *entry)
+{
+    const struct host_node_owner *owner = RB_ENTRY_VALUE(entry, const struct host_node_owner, entry);
+    CUgraphNode node = *(const CUgraphNode *)key;
+    return node < owner->node ? -1 : node > owner->node;
+}
+
+static struct rb_tree  host_node_owners       = { host_node_owner_compare };
+static pthread_mutex_t host_node_owners_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static struct host_node_owner *get_host_node_owner(CUgraphNode node)
+{
+    struct rb_entry *entry = rb_get(&host_node_owners, &node);
+    return entry ? RB_ENTRY_VALUE(entry, struct host_node_owner, entry) : NULL;
+}
+
+/* Records that node owns object and wrapper. Returns the user object the node owned before in
+ * the same graph, whose graph reference the caller gives back. */
+static void *set_host_node_owner(CUgraphNode node, CUgraph graph, void *object,
+                                 struct stream_callback_entry *wrapper)
+{
+    struct host_node_owner *owner;
+    void *old = NULL;
+
+    pthread_mutex_lock(&host_node_owners_mutex);
+    if ((owner = get_host_node_owner(node)))
+    {
+        if (owner->graph == graph)
+            old = owner->object;
+    }
+    else if ((owner = calloc(1, sizeof(*owner))))
+    {
+        owner->node = node;
+        rb_put(&host_node_owners, &node, &owner->entry);
+    }
+    else ERR("out of memory, host node wrapper %p stays until graph %p is destroyed\n", wrapper, graph);
+
+    if (owner)
+    {
+        owner->graph   = graph;
+        owner->object  = object;
+        owner->wrapper = wrapper;
+    }
+    pthread_mutex_unlock(&host_node_owners_mutex);
+    return old;
+}
+
+/* Forgets the owner of node and returns its user object, for cuGraphDestroyNode. */
+static void *remove_host_node_owner(CUgraphNode node, CUgraph *graph)
+{
+    struct host_node_owner *owner;
+    void *object = NULL;
+
+    pthread_mutex_lock(&host_node_owners_mutex);
+    if ((owner = get_host_node_owner(node)))
+    {
+        rb_remove(&host_node_owners, &owner->entry);
+        object = owner->object;
+        *graph = owner->graph;
+        free(owner);
+    }
+    pthread_mutex_unlock(&host_node_owners_mutex);
+    return object;
+}
+
+/* Forgets the owners of the nodes of a destroyed graph. The graph gave back its references. */
+static void remove_graph_host_nodes(CUgraph graph)
+{
+    struct host_node_owner *owner, *list = NULL;
+
+    pthread_mutex_lock(&host_node_owners_mutex);
+    RB_FOR_EACH_ENTRY(owner, &host_node_owners, struct host_node_owner, entry)
+    {
+        if (owner->graph != graph) continue;
+        owner->next = list;
+        list = owner;
+    }
+    while ((owner = list))
+    {
+        list = owner->next;
+        rb_remove(&host_node_owners, &owner->entry);
+        free(owner);
+    }
+    pthread_mutex_unlock(&host_node_owners_mutex);
+}
+
+/* One change of host node parameters: wrap_host_params before the driver call, finish_host_params
+ * after it. */
+struct host_install
+{
+    CUgraph graph;                          /* owns the wrapper; NULL for a wrapper never freed */
+    CUgraphNode node;                       /* the node whose parameters change; NULL for a new node */
+    void *object;                           /* new user object, already held by graph */
+    struct stream_callback_entry *wrapper;  /* the wrapper object owns */
+};
+
+/* Puts host_node_wrapper into params in place of the Windows function. With a graph, a new wrapper
+ * gets a user object that the graph holds before the driver sees the node, so the node can never
+ * run a wrapper nobody owns. A node that keeps its function and argument keeps its wrapper.
+ * Without a graph, as for an executable graph, the wrapper is never freed. */
+static CUresult wrap_host_params(struct host_install *install, struct host_node_params *params)
+{
+    struct stream_callback_entry *node = NULL;
+    struct host_node_owner *owner;
+    void *object;
     CUresult ret;
 
-    *object = NULL;
+    install->object  = NULL;
+    install->wrapper = NULL;
     if (!params->fn)
         return CUDA_SUCCESS; /* the driver reports the error */
 
-    if (!graph)
+    if (!install->graph)
     {
         if (!(node = get_static_host_node(params->fn, params->userData)))
             return CUDA_ERROR_OUT_OF_MEMORY;
-    }
-    else
-    {
-        if (!(node = calloc(1, sizeof(*node))))
-            return CUDA_ERROR_OUT_OF_MEMORY;
-        if (!start_callback_worker())
-        {
-            free(node);
-            return CUDA_ERROR_OUT_OF_MEMORY;
-        }
-        node->hostfn        = params->fn;
-        node->args.userdata = params->userData;
-        if ((ret = pcuUserObjectCreate(object, node, host_node_destroy, 1, CU_USER_OBJECT_NO_DESTRUCTOR_SYNC)))
-        {
-            *object = NULL;
-            abandon_callback(node);
-            return ret;
-        }
+        goto done;
     }
 
-    TRACE("host node %p(%p) runs through wrapper %p\n", params->fn, params->userData, node);
+    if (install->node)
+    {
+        pthread_mutex_lock(&host_node_owners_mutex);
+        if ((owner = get_host_node_owner(install->node)) && owner->graph == install->graph &&
+            owner->wrapper->hostfn == params->fn && owner->wrapper->args.userdata == params->userData)
+            node = owner->wrapper;
+        pthread_mutex_unlock(&host_node_owners_mutex);
+        if (node)
+            goto done;
+    }
+
+    if (!(node = calloc(1, sizeof(*node))))
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    if (!start_callback_worker())
+    {
+        free(node);
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    node->hostfn        = params->fn;
+    node->args.userdata = params->userData;
+    if ((ret = pcuUserObjectCreate(&object, node, host_node_destroy, 1, CU_USER_OBJECT_NO_DESTRUCTOR_SYNC)))
+    {
+        abandon_callback(node);
+        return ret;
+    }
+    __atomic_add_fetch(&num_host_node_wrappers, 1, __ATOMIC_RELAXED);
+    if ((ret = pcuGraphRetainUserObject(install->graph, object, 1, CU_GRAPH_USER_OBJECT_MOVE)))
+    {
+        pcuUserObjectRelease(object, 1);
+        return ret;
+    }
+    install->object  = object;
+    install->wrapper = node;
+    TRACE("new host node wrapper %p for %p(%p), %d live\n", node, params->fn, params->userData,
+          __atomic_load_n(&num_host_node_wrappers, __ATOMIC_RELAXED));
+
+done:
     params->fn       = host_node_wrapper;
     params->userData = node;
     return CUDA_SUCCESS;
 }
 
-/* Gives the user object from wrap_host_params to the graph once the driver took the node, or
- * destroys it if the driver refused. */
-static void finish_host_params(CUgraph graph, void *object, CUresult ret)
+/* After the driver call: if it failed, the graph gives back the new wrapper. If it worked, the
+ * node (new_node for a node just added) owns the new wrapper, and the graph gives back the one
+ * the node owned before. */
+static void finish_host_params(struct host_install *install, CUresult ret, CUgraphNode new_node)
 {
-    if (!object)
+    CUgraphNode node = install->node ? install->node : new_node;
+    void *old;
+
+    if (!install->object)
         return;
     if (ret)
-        pcuUserObjectRelease(object, 1);
-    else if (pcuGraphRetainUserObject(graph, object, 1, CU_GRAPH_USER_OBJECT_MOVE))
-        ERR("graph %p did not take user object %p, its host node wrapper leaks\n", graph, object);
+    {
+        pcuGraphReleaseUserObject(install->graph, install->object, 1);
+        return;
+    }
+    if (node && (old = set_host_node_owner(node, install->graph, install->object, install->wrapper)))
+        pcuGraphReleaseUserObject(install->graph, old, 1);
 }
 
 /* As wrap_host_params, for CUgraphNodeParams. *params is what to pass to the driver. */
-static CUresult wrap_node_params(CUgraph graph, const void *in, struct graph_node_params *copy,
-                                 void **params, void **object)
+static CUresult wrap_node_params(struct host_install *install, const void *in,
+                                 struct graph_node_params *copy, void **params)
 {
     const struct graph_node_params *node_params = in;
 
-    *object = NULL;
+    install->object = NULL;
     *params = (void *)in;
     if (!node_params || node_params->type != CU_GRAPH_NODE_TYPE_HOST)
         return CUDA_SUCCESS;
 
     *copy = *node_params;
     *params = copy;
-    return wrap_host_params(graph, &copy->host, object);
+    return wrap_host_params(install, &copy->host);
 }
 
 /* Puts the Windows function back into host node parameters read from the driver. */
@@ -3189,7 +3338,15 @@ static void unwrap_host_params(struct host_node_params *params)
  * driver cannot say, and the wrapper is then never freed. */
 static CUgraph node_graph(CUgraphNode node)
 {
-    CUgraph graph;
+    struct host_node_owner *owner;
+    CUgraph graph = NULL;
+
+    pthread_mutex_lock(&host_node_owners_mutex);
+    if ((owner = get_host_node_owner(node)))
+        graph = owner->graph;
+    pthread_mutex_unlock(&host_node_owners_mutex);
+    if (graph)
+        return graph;
 
     if (!pcuGraphNodeGetContainingGraph || pcuGraphNodeGetContainingGraph(node, &graph))
         return NULL;
@@ -3259,13 +3416,19 @@ static CUresult launch_host_func(struct launch_host_func_args *args, void *fn, v
         status == CU_STREAM_CAPTURE_STATUS_ACTIVE)
     {
         struct host_node_params params = { fn, userData };
-        void *object;
+        struct host_install install = { graph };
+        const CUgraphNode *deps;
+        CUgraphNode node = NULL;
+        size_t count;
         CUresult ret;
 
-        if ((ret = wrap_host_params(graph, &params, &object)))
+        if ((ret = wrap_host_params(&install, &params)))
             return ret;
         ret = call_launch_host_func(args, params.fn, params.userData);
-        finish_host_params(graph, object, ret);
+        /* The node just captured is now the one the stream's next work depends on. */
+        if (!ret && !args->capture_info(args->stream, &status, NULL, NULL, &deps, &count) && count == 1)
+            node = deps[0];
+        finish_host_params(&install, ret, node);
         return ret;
     }
 
@@ -4322,17 +4485,17 @@ CUresult WINAPI wine_cuGraphAddKernelNode(CUgraphNode *phGraphNode, CUgraph hGra
 CUresult WINAPI wine_cuGraphAddHostNode(CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies, size_t numDependencies, const CUDA_NODE_PARAMS *nodeParams)
 {
     TRACE("(%p, %p, %p, %zu, %p)\n", phGraphNode, hGraph, dependencies, numDependencies, nodeParams);
+    struct host_install install = { hGraph };
     struct host_node_params params;
-    void *object;
     CUresult ret;
 
     if (!nodeParams)
         return pcuGraphAddHostNode(phGraphNode, hGraph, dependencies, numDependencies, nodeParams);
     params = *(const struct host_node_params *)nodeParams;
-    if ((ret = wrap_host_params(hGraph, &params, &object)))
+    if ((ret = wrap_host_params(&install, &params)))
         return ret;
     ret = pcuGraphAddHostNode(phGraphNode, hGraph, dependencies, numDependencies, (const CUDA_NODE_PARAMS *)&params);
-    finish_host_params(hGraph, object, ret);
+    finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
     return ret;
 }
 
@@ -4399,13 +4562,23 @@ CUresult WINAPI wine_cuStreamEndCapture_ptsz(CUstream hStream, CUgraph *phGraph)
 CUresult WINAPI wine_cuGraphDestroyNode(CUgraphNode hNode)
 {
     TRACE("(%p)\n", hNode);
-    return pcuGraphDestroyNode(hNode);
+    CUgraph graph;
+    void *object;
+    CUresult ret = pcuGraphDestroyNode(hNode);
+
+    if (!ret && (object = remove_host_node_owner(hNode, &graph)))
+        pcuGraphReleaseUserObject(graph, object, 1);
+    return ret;
 }
 
 CUresult WINAPI wine_cuGraphDestroy(CUgraph hGraph)
 {
     TRACE("(%p)\n", hGraph);
-    return pcuGraphDestroy(hGraph);
+    CUresult ret = pcuGraphDestroy(hGraph);
+
+    if (!ret)
+        remove_graph_host_nodes(hGraph);
+    return ret;
 }
 
 CUresult WINAPI wine_cuGraphExecDestroy(CUgraphExec hGraphExec)
@@ -4615,19 +4788,18 @@ CUresult WINAPI wine_cuGraphHostNodeGetParams(CUgraphNode hNode, void *nodeParam
 CUresult WINAPI wine_cuGraphHostNodeSetParams(CUgraphNode hNode, const void *nodeParams)
 {
     TRACE("(%p, %p)\n", hNode, nodeParams);
+    struct host_install install = { NULL, hNode };
     struct host_node_params params;
-    CUgraph graph;
-    void *object;
     CUresult ret;
 
     if (!nodeParams)
         return pcuGraphHostNodeSetParams(hNode, nodeParams);
     params = *(const struct host_node_params *)nodeParams;
-    graph = node_graph(hNode);
-    if ((ret = wrap_host_params(graph, &params, &object)))
+    install.graph = node_graph(hNode);
+    if ((ret = wrap_host_params(&install, &params)))
         return ret;
     ret = pcuGraphHostNodeSetParams(hNode, &params);
-    finish_host_params(graph, object, ret);
+    finish_host_params(&install, ret, NULL);
     return ret;
 }
 
@@ -4712,14 +4884,14 @@ CUresult WINAPI wine_cuGraphExecMemsetNodeSetParams(CUgraphExec hGraphExec, CUgr
 CUresult WINAPI wine_cuGraphExecHostNodeSetParams(CUgraphExec hGraphExec, CUgraphNode hNode, const void *nodeParams)
 {
     TRACE("(%p, %p, %p)\n", hGraphExec, hNode, nodeParams);
+    struct host_install install = { NULL };
     struct host_node_params params;
-    void *object;
     CUresult ret;
 
     if (!nodeParams)
         return pcuGraphExecHostNodeSetParams(hGraphExec, hNode, nodeParams);
     params = *(const struct host_node_params *)nodeParams;
-    if ((ret = wrap_host_params(NULL, &params, &object)))
+    if ((ret = wrap_host_params(&install, &params)))
         return ret;
     return pcuGraphExecHostNodeSetParams(hGraphExec, hNode, &params);
 }
@@ -5821,44 +5993,47 @@ CUresult WINAPI wine_cuMemPrefetchAsync_v2_ptsz(CUdeviceptr_v2 devPtr, size_t co
 CUresult WINAPI wine_cuGraphAddNode(CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies, size_t numDependencies, void *nodeParams)
 {
     TRACE("(%p, %p, %p, %zu, %p\n", phGraphNode, hGraph, dependencies, numDependencies, nodeParams);
+    struct host_install install = { hGraph };
     struct graph_node_params copy;
-    void *params, *object;
+    void *params;
     CUresult ret;
 
     CHECK_FUNCPTR(cuGraphAddNode);
-    if ((ret = wrap_node_params(hGraph, nodeParams, &copy, &params, &object)))
+    if ((ret = wrap_node_params(&install, nodeParams, &copy, &params)))
         return ret;
     ret = pcuGraphAddNode(phGraphNode, hGraph, dependencies, numDependencies, params);
-    finish_host_params(hGraph, object, ret);
+    finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
     return ret;
 }
 
 CUresult WINAPI wine_cuGraphNodeSetParams(CUgraphNode hNode, void *nodeParams)
 {
     TRACE("(%p, %p\n", hNode, nodeParams);
+    struct host_install install = { NULL, hNode };
     struct graph_node_params copy;
-    void *params, *object;
-    CUgraph graph;
+    void *params;
     CUresult ret;
 
     CHECK_FUNCPTR(cuGraphNodeSetParams);
-    graph = node_graph(hNode);
-    if ((ret = wrap_node_params(graph, nodeParams, &copy, &params, &object)))
+    if (nodeParams && ((const struct graph_node_params *)nodeParams)->type == CU_GRAPH_NODE_TYPE_HOST)
+        install.graph = node_graph(hNode);
+    if ((ret = wrap_node_params(&install, nodeParams, &copy, &params)))
         return ret;
     ret = pcuGraphNodeSetParams(hNode, params);
-    finish_host_params(graph, object, ret);
+    finish_host_params(&install, ret, NULL);
     return ret;
 }
 
 CUresult WINAPI wine_cuGraphExecNodeSetParams(CUgraphExec hGraphExec, CUgraphNode hNode, void *nodeParams)
 {
     TRACE("%p, %p, %p\n", hGraphExec, hNode, nodeParams);
+    struct host_install install = { NULL };
     struct graph_node_params copy;
-    void *params, *object;
+    void *params;
     CUresult ret;
 
     CHECK_FUNCPTR(cuGraphExecNodeSetParams);
-    if ((ret = wrap_node_params(NULL, nodeParams, &copy, &params, &object)))
+    if ((ret = wrap_node_params(&install, nodeParams, &copy, &params)))
         return ret;
     return pcuGraphExecNodeSetParams(hGraphExec, hNode, params);
 }
@@ -5959,15 +6134,16 @@ CUresult WINAPI wine_cuStreamUpdateCaptureDependencies_v2_ptsz(CUstream hStream,
 CUresult WINAPI wine_cuGraphAddNode_v2(CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies, const void *dependencyData, size_t numDependencies, void *nodeParams)
 {
     TRACE("(%p, %p, %p, %p, %zu, %p)\n", phGraphNode, hGraph, dependencies, dependencyData, numDependencies, nodeParams);
+    struct host_install install = { hGraph };
     struct graph_node_params copy;
-    void *params, *object;
+    void *params;
     CUresult ret;
 
     CHECK_FUNCPTR(cuGraphAddNode_v2);
-    if ((ret = wrap_node_params(hGraph, nodeParams, &copy, &params, &object)))
+    if ((ret = wrap_node_params(&install, nodeParams, &copy, &params)))
         return ret;
     ret = pcuGraphAddNode_v2(phGraphNode, hGraph, dependencies, dependencyData, numDependencies, params);
-    finish_host_params(hGraph, object, ret);
+    finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
     return ret;
 }
 
@@ -6807,32 +6983,34 @@ CUresult WINAPI wine_cuStreamBeginRecaptureToGraph_ptsz(CUstream hStream, CUstre
 CUresult WINAPI wine_cuGraphAddNode_v3(CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies, const void *dependencyData, size_t numDependencies, void *nodeParams)
 {
     TRACE("(%p, %p, %p, %p, %zu, %p)\n", phGraphNode, hGraph, dependencies, dependencyData, numDependencies, nodeParams);
+    struct host_install install = { hGraph };
     struct graph_node_params copy;
-    void *params, *object;
+    void *params;
     CUresult ret;
 
     CHECK_FUNCPTR(cuGraphAddNode_v3);
-    if ((ret = wrap_node_params(hGraph, nodeParams, &copy, &params, &object)))
+    if ((ret = wrap_node_params(&install, nodeParams, &copy, &params)))
         return ret;
     ret = pcuGraphAddNode_v3(phGraphNode, hGraph, dependencies, dependencyData, numDependencies, params);
-    finish_host_params(hGraph, object, ret);
+    finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
     return ret;
 }
 
 CUresult WINAPI wine_cuGraphNodeSetParams_v2(CUgraphNode hNode, void *nodeParams)
 {
     TRACE("(%p, %p)\n", hNode, nodeParams);
+    struct host_install install = { NULL, hNode };
     struct graph_node_params copy;
-    void *params, *object;
-    CUgraph graph;
+    void *params;
     CUresult ret;
 
     CHECK_FUNCPTR(cuGraphNodeSetParams_v2);
-    graph = node_graph(hNode);
-    if ((ret = wrap_node_params(graph, nodeParams, &copy, &params, &object)))
+    if (nodeParams && ((const struct graph_node_params *)nodeParams)->type == CU_GRAPH_NODE_TYPE_HOST)
+        install.graph = node_graph(hNode);
+    if ((ret = wrap_node_params(&install, nodeParams, &copy, &params)))
         return ret;
     ret = pcuGraphNodeSetParams_v2(hNode, params);
-    finish_host_params(graph, object, ret);
+    finish_host_params(&install, ret, NULL);
     return ret;
 }
 
