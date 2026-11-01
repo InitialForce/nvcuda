@@ -3124,7 +3124,10 @@ struct host_node_owner
     CUgraph graph;
     void *object;
     struct stream_callback_entry *wrapper;
-    struct host_node_owner *next; /* for remove_graph_host_nodes */
+    /* While a stream capture adds nodes: the stream, and the thread for a per-thread stream. */
+    CUstream capture_stream;
+    DWORD capture_thread;
+    struct host_node_owner *next; /* for remove_host_nodes */
 };
 
 static int host_node_owner_compare(const void *key, const struct rb_entry *entry)
@@ -3134,8 +3137,16 @@ static int host_node_owner_compare(const void *key, const struct rb_entry *entry
     return node < owner->node ? -1 : node > owner->node;
 }
 
+/* Held across each driver call that adds, changes or destroys a host node or a graph, and the
+ * change to the tree that goes with it, so that a node handle the driver reuses cannot meet a
+ * stale entry. Nothing that runs under it takes it again: the user object destructor the driver
+ * may call meanwhile takes only the callback mutex. */
 static struct rb_tree  host_node_owners       = { host_node_owner_compare };
 static pthread_mutex_t host_node_owners_mutex = PTHREAD_MUTEX_INITIALIZER;
+static unsigned int    num_host_node_owners;
+
+static void lock_host_nodes(void)   { pthread_mutex_lock(&host_node_owners_mutex); }
+static void unlock_host_nodes(void) { pthread_mutex_unlock(&host_node_owners_mutex); }
 
 static struct host_node_owner *get_host_node_owner(CUgraphNode node)
 {
@@ -3146,12 +3157,12 @@ static struct host_node_owner *get_host_node_owner(CUgraphNode node)
 /* Records that node owns object and wrapper. Returns the user object the node owned before in
  * the same graph, whose graph reference the caller gives back. */
 static void *set_host_node_owner(CUgraphNode node, CUgraph graph, void *object,
-                                 struct stream_callback_entry *wrapper)
+                                 struct stream_callback_entry *wrapper, CUstream capture_stream,
+                                 DWORD capture_thread)
 {
     struct host_node_owner *owner;
     void *old = NULL;
 
-    pthread_mutex_lock(&host_node_owners_mutex);
     if ((owner = get_host_node_owner(node)))
     {
         if (owner->graph == graph)
@@ -3161,16 +3172,21 @@ static void *set_host_node_owner(CUgraphNode node, CUgraph graph, void *object,
     {
         owner->node = node;
         rb_put(&host_node_owners, &node, &owner->entry);
+        num_host_node_owners++;
     }
     else ERR("out of memory, host node wrapper %p stays until graph %p is destroyed\n", wrapper, graph);
 
     if (owner)
     {
-        owner->graph   = graph;
-        owner->object  = object;
-        owner->wrapper = wrapper;
+        owner->graph          = graph;
+        owner->object         = object;
+        owner->wrapper        = wrapper;
+        if (capture_stream) /* a change during capture leaves the node to its capture */
+        {
+            owner->capture_stream = capture_stream;
+            owner->capture_thread = capture_thread;
+        }
     }
-    pthread_mutex_unlock(&host_node_owners_mutex);
     return old;
 }
 
@@ -3180,27 +3196,34 @@ static void *remove_host_node_owner(CUgraphNode node, CUgraph *graph)
     struct host_node_owner *owner;
     void *object = NULL;
 
-    pthread_mutex_lock(&host_node_owners_mutex);
     if ((owner = get_host_node_owner(node)))
     {
         rb_remove(&host_node_owners, &owner->entry);
+        num_host_node_owners--;
         object = owner->object;
         *graph = owner->graph;
         free(owner);
     }
-    pthread_mutex_unlock(&host_node_owners_mutex);
     return object;
 }
 
-/* Forgets the owners of the nodes of a destroyed graph. The graph gave back its references. */
-static void remove_graph_host_nodes(CUgraph graph)
+/* Forgets the owners of the nodes of a destroyed graph, which gave back its references. With
+ * stream set instead, does that for the nodes an ended capture on that stream added; if the
+ * capture failed, the driver destroyed its graph. If it worked, the nodes stay. */
+static void remove_host_nodes(CUgraph graph, CUstream stream, DWORD thread, BOOL failed)
 {
     struct host_node_owner *owner, *list = NULL;
+    unsigned int count = 0;
 
-    pthread_mutex_lock(&host_node_owners_mutex);
     RB_FOR_EACH_ENTRY(owner, &host_node_owners, struct host_node_owner, entry)
     {
-        if (owner->graph != graph) continue;
+        if (stream)
+        {
+            if (owner->capture_stream != stream || owner->capture_thread != thread) continue;
+            owner->capture_stream = NULL;
+            if (!failed) continue;
+        }
+        else if (owner->graph != graph) continue;
         owner->next = list;
         list = owner;
     }
@@ -3209,8 +3232,23 @@ static void remove_graph_host_nodes(CUgraph graph)
         list = owner->next;
         rb_remove(&host_node_owners, &owner->entry);
         free(owner);
+        num_host_node_owners--;
+        count++;
     }
-    pthread_mutex_unlock(&host_node_owners_mutex);
+    if (stream && failed)
+        TRACE("capture on %p failed, forgot %u host nodes, %u left\n", stream, count, num_host_node_owners);
+}
+
+/* The key of a capturing stream: a per-thread default stream is a different stream on each thread. */
+static CUstream capture_stream_key(CUstream stream, DWORD *thread)
+{
+    *thread = 0;
+    if (!stream || stream == (CUstream)0x2 /* CU_STREAM_PER_THREAD */)
+    {
+        *thread = GetCurrentThreadId();
+        return (CUstream)0x2;
+    }
+    return stream;
 }
 
 /* One change of host node parameters: wrap_host_params before the driver call, finish_host_params
@@ -3221,6 +3259,8 @@ struct host_install
     CUgraphNode node;                       /* the node whose parameters change; NULL for a new node */
     void *object;                           /* new user object, already held by graph */
     struct stream_callback_entry *wrapper;  /* the wrapper object owns */
+    CUstream capture_stream;                /* for a node added by stream capture, as */
+    DWORD capture_thread;                   /* capture_stream_key gives them */
 };
 
 /* Puts host_node_wrapper into params in place of the Windows function. With a graph, a new wrapper
@@ -3246,15 +3286,11 @@ static CUresult wrap_host_params(struct host_install *install, struct host_node_
         goto done;
     }
 
-    if (install->node)
+    if (install->node && (owner = get_host_node_owner(install->node)) && owner->graph == install->graph &&
+        owner->wrapper->hostfn == params->fn && owner->wrapper->args.userdata == params->userData)
     {
-        pthread_mutex_lock(&host_node_owners_mutex);
-        if ((owner = get_host_node_owner(install->node)) && owner->graph == install->graph &&
-            owner->wrapper->hostfn == params->fn && owner->wrapper->args.userdata == params->userData)
-            node = owner->wrapper;
-        pthread_mutex_unlock(&host_node_owners_mutex);
-        if (node)
-            goto done;
+        node = owner->wrapper;
+        goto done;
     }
 
     if (!(node = calloc(1, sizeof(*node))))
@@ -3303,7 +3339,8 @@ static void finish_host_params(struct host_install *install, CUresult ret, CUgra
         pcuGraphReleaseUserObject(install->graph, install->object, 1);
         return;
     }
-    if (node && (old = set_host_node_owner(node, install->graph, install->object, install->wrapper)))
+    if (node && (old = set_host_node_owner(node, install->graph, install->object, install->wrapper,
+                                            install->capture_stream, install->capture_thread)))
         pcuGraphReleaseUserObject(install->graph, old, 1);
 }
 
@@ -3341,10 +3378,8 @@ static CUgraph node_graph(CUgraphNode node)
     struct host_node_owner *owner;
     CUgraph graph = NULL;
 
-    pthread_mutex_lock(&host_node_owners_mutex);
     if ((owner = get_host_node_owner(node)))
         graph = owner->graph;
-    pthread_mutex_unlock(&host_node_owners_mutex);
     if (graph)
         return graph;
 
@@ -3422,13 +3457,17 @@ static CUresult launch_host_func(struct launch_host_func_args *args, void *fn, v
         size_t count;
         CUresult ret;
 
-        if ((ret = wrap_host_params(&install, &params)))
-            return ret;
-        ret = call_launch_host_func(args, params.fn, params.userData);
-        /* The node just captured is now the one the stream's next work depends on. */
-        if (!ret && !args->capture_info(args->stream, &status, NULL, NULL, &deps, &count) && count == 1)
-            node = deps[0];
-        finish_host_params(&install, ret, node);
+        install.capture_stream = capture_stream_key(args->stream, &install.capture_thread);
+        lock_host_nodes();
+        if (!(ret = wrap_host_params(&install, &params)))
+        {
+            ret = call_launch_host_func(args, params.fn, params.userData);
+            /* The node just captured is now the one the stream's next work depends on. */
+            if (!ret && !args->capture_info(args->stream, &status, NULL, NULL, &deps, &count) && count == 1)
+                node = deps[0];
+            finish_host_params(&install, ret, node);
+        }
+        unlock_host_nodes();
         return ret;
     }
 
@@ -4492,10 +4531,13 @@ CUresult WINAPI wine_cuGraphAddHostNode(CUgraphNode *phGraphNode, CUgraph hGraph
     if (!nodeParams)
         return pcuGraphAddHostNode(phGraphNode, hGraph, dependencies, numDependencies, nodeParams);
     params = *(const struct host_node_params *)nodeParams;
-    if ((ret = wrap_host_params(&install, &params)))
-        return ret;
-    ret = pcuGraphAddHostNode(phGraphNode, hGraph, dependencies, numDependencies, (const CUDA_NODE_PARAMS *)&params);
-    finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
+    lock_host_nodes();
+    if (!(ret = wrap_host_params(&install, &params)))
+    {
+        ret = pcuGraphAddHostNode(phGraphNode, hGraph, dependencies, numDependencies, (const CUDA_NODE_PARAMS *)&params);
+        finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
+    }
+    unlock_host_nodes();
     return ret;
 }
 
@@ -4550,13 +4592,31 @@ CUresult WINAPI wine_cuStreamBeginCapture_v2_ptsz(CUstream hStream, CUstreamCapt
 CUresult WINAPI wine_cuStreamEndCapture(CUstream hStream, CUgraph *phGraph)
 {
     TRACE("(%p, %p)\n", hStream, phGraph);
-    return pcuStreamEndCapture(hStream, phGraph);
+    CUstream stream;
+    DWORD thread;
+    CUresult ret;
+
+    lock_host_nodes();
+    ret = pcuStreamEndCapture(hStream, phGraph);
+    stream = capture_stream_key(hStream, &thread);
+    remove_host_nodes(NULL, stream, thread, ret || !phGraph || !*phGraph);
+    unlock_host_nodes();
+    return ret;
 }
 
 CUresult WINAPI wine_cuStreamEndCapture_ptsz(CUstream hStream, CUgraph *phGraph)
 {
     TRACE("(%p, %p)\n", hStream, phGraph);
-    return pcuStreamEndCapture_ptsz(hStream, phGraph);
+    CUstream stream;
+    DWORD thread;
+    CUresult ret;
+
+    lock_host_nodes();
+    ret = pcuStreamEndCapture_ptsz(hStream, phGraph);
+    stream = capture_stream_key(hStream, &thread);
+    remove_host_nodes(NULL, stream, thread, ret || !phGraph || !*phGraph);
+    unlock_host_nodes();
+    return ret;
 }
 
 CUresult WINAPI wine_cuGraphDestroyNode(CUgraphNode hNode)
@@ -4564,20 +4624,24 @@ CUresult WINAPI wine_cuGraphDestroyNode(CUgraphNode hNode)
     TRACE("(%p)\n", hNode);
     CUgraph graph;
     void *object;
-    CUresult ret = pcuGraphDestroyNode(hNode);
+    CUresult ret;
 
-    if (!ret && (object = remove_host_node_owner(hNode, &graph)))
+    lock_host_nodes();
+    if (!(ret = pcuGraphDestroyNode(hNode)) && (object = remove_host_node_owner(hNode, &graph)))
         pcuGraphReleaseUserObject(graph, object, 1);
+    unlock_host_nodes();
     return ret;
 }
 
 CUresult WINAPI wine_cuGraphDestroy(CUgraph hGraph)
 {
     TRACE("(%p)\n", hGraph);
-    CUresult ret = pcuGraphDestroy(hGraph);
+    CUresult ret;
 
-    if (!ret)
-        remove_graph_host_nodes(hGraph);
+    lock_host_nodes();
+    if (!(ret = pcuGraphDestroy(hGraph)))
+        remove_host_nodes(hGraph, NULL, 0, FALSE);
+    unlock_host_nodes();
     return ret;
 }
 
@@ -4795,11 +4859,14 @@ CUresult WINAPI wine_cuGraphHostNodeSetParams(CUgraphNode hNode, const void *nod
     if (!nodeParams)
         return pcuGraphHostNodeSetParams(hNode, nodeParams);
     params = *(const struct host_node_params *)nodeParams;
+    lock_host_nodes();
     install.graph = node_graph(hNode);
-    if ((ret = wrap_host_params(&install, &params)))
-        return ret;
-    ret = pcuGraphHostNodeSetParams(hNode, &params);
-    finish_host_params(&install, ret, NULL);
+    if (!(ret = wrap_host_params(&install, &params)))
+    {
+        ret = pcuGraphHostNodeSetParams(hNode, &params);
+        finish_host_params(&install, ret, NULL);
+    }
+    unlock_host_nodes();
     return ret;
 }
 
@@ -5999,10 +6066,13 @@ CUresult WINAPI wine_cuGraphAddNode(CUgraphNode *phGraphNode, CUgraph hGraph, co
     CUresult ret;
 
     CHECK_FUNCPTR(cuGraphAddNode);
-    if ((ret = wrap_node_params(&install, nodeParams, &copy, &params)))
-        return ret;
-    ret = pcuGraphAddNode(phGraphNode, hGraph, dependencies, numDependencies, params);
-    finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
+    lock_host_nodes();
+    if (!(ret = wrap_node_params(&install, nodeParams, &copy, &params)))
+    {
+        ret = pcuGraphAddNode(phGraphNode, hGraph, dependencies, numDependencies, params);
+        finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
+    }
+    unlock_host_nodes();
     return ret;
 }
 
@@ -6015,12 +6085,15 @@ CUresult WINAPI wine_cuGraphNodeSetParams(CUgraphNode hNode, void *nodeParams)
     CUresult ret;
 
     CHECK_FUNCPTR(cuGraphNodeSetParams);
+    lock_host_nodes();
     if (nodeParams && ((const struct graph_node_params *)nodeParams)->type == CU_GRAPH_NODE_TYPE_HOST)
         install.graph = node_graph(hNode);
-    if ((ret = wrap_node_params(&install, nodeParams, &copy, &params)))
-        return ret;
-    ret = pcuGraphNodeSetParams(hNode, params);
-    finish_host_params(&install, ret, NULL);
+    if (!(ret = wrap_node_params(&install, nodeParams, &copy, &params)))
+    {
+        ret = pcuGraphNodeSetParams(hNode, params);
+        finish_host_params(&install, ret, NULL);
+    }
+    unlock_host_nodes();
     return ret;
 }
 
@@ -6140,10 +6213,13 @@ CUresult WINAPI wine_cuGraphAddNode_v2(CUgraphNode *phGraphNode, CUgraph hGraph,
     CUresult ret;
 
     CHECK_FUNCPTR(cuGraphAddNode_v2);
-    if ((ret = wrap_node_params(&install, nodeParams, &copy, &params)))
-        return ret;
-    ret = pcuGraphAddNode_v2(phGraphNode, hGraph, dependencies, dependencyData, numDependencies, params);
-    finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
+    lock_host_nodes();
+    if (!(ret = wrap_node_params(&install, nodeParams, &copy, &params)))
+    {
+        ret = pcuGraphAddNode_v2(phGraphNode, hGraph, dependencies, dependencyData, numDependencies, params);
+        finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
+    }
+    unlock_host_nodes();
     return ret;
 }
 
@@ -6989,10 +7065,13 @@ CUresult WINAPI wine_cuGraphAddNode_v3(CUgraphNode *phGraphNode, CUgraph hGraph,
     CUresult ret;
 
     CHECK_FUNCPTR(cuGraphAddNode_v3);
-    if ((ret = wrap_node_params(&install, nodeParams, &copy, &params)))
-        return ret;
-    ret = pcuGraphAddNode_v3(phGraphNode, hGraph, dependencies, dependencyData, numDependencies, params);
-    finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
+    lock_host_nodes();
+    if (!(ret = wrap_node_params(&install, nodeParams, &copy, &params)))
+    {
+        ret = pcuGraphAddNode_v3(phGraphNode, hGraph, dependencies, dependencyData, numDependencies, params);
+        finish_host_params(&install, ret, ret ? NULL : *phGraphNode);
+    }
+    unlock_host_nodes();
     return ret;
 }
 
@@ -7005,12 +7084,15 @@ CUresult WINAPI wine_cuGraphNodeSetParams_v2(CUgraphNode hNode, void *nodeParams
     CUresult ret;
 
     CHECK_FUNCPTR(cuGraphNodeSetParams_v2);
+    lock_host_nodes();
     if (nodeParams && ((const struct graph_node_params *)nodeParams)->type == CU_GRAPH_NODE_TYPE_HOST)
         install.graph = node_graph(hNode);
-    if ((ret = wrap_node_params(&install, nodeParams, &copy, &params)))
-        return ret;
-    ret = pcuGraphNodeSetParams_v2(hNode, params);
-    finish_host_params(&install, ret, NULL);
+    if (!(ret = wrap_node_params(&install, nodeParams, &copy, &params)))
+    {
+        ret = pcuGraphNodeSetParams_v2(hNode, params);
+        finish_host_params(&install, ret, NULL);
+    }
+    unlock_host_nodes();
     return ret;
 }
 
