@@ -2915,9 +2915,9 @@ static DWORD WINAPI stream_callback_worker_thread(LPVOID parameter)
                         TRACE("stream callback %p returned\n", wrapper->callback);
                     }
 
+                    pthread_mutex_lock(&stream_callback_mutex);
                     wrapper->status = STREAM_CALLBACK_EXECUTED;
                     pthread_cond_broadcast(&stream_callback_reply);
-                    pthread_mutex_lock(&stream_callback_mutex);
                     break;
 
                 default:
@@ -2936,20 +2936,60 @@ end:
     return 0;
 }
 
+/* Starts the worker thread if none runs and counts one more callback for it. Needs a Wine thread. */
+static BOOL start_callback_worker(void)
+{
+    BOOL ret = TRUE;
+
+    pthread_mutex_lock(&stream_callback_mutex);
+    if (!num_stream_callbacks++)
+    {
+        HANDLE thread = CreateThread(NULL, 0, stream_callback_worker_thread, NULL, 0, NULL);
+        if (thread)
+            CloseHandle(thread);
+        else
+        {
+            num_stream_callbacks--;
+            ret = FALSE;
+        }
+    }
+    pthread_mutex_unlock(&stream_callback_mutex);
+    return ret;
+}
+
+/* Frees a callback that will never run and takes back its count. The last count goes to the
+ * worker as an abandoned entry, so that the thread ends. Needs no Wine thread state. */
+static void abandon_callback(struct stream_callback_entry *wrapper)
+{
+    pthread_mutex_lock(&stream_callback_mutex);
+    if (num_stream_callbacks == 1)
+    {
+        wrapper->status = STREAM_CALLBACK_ABANDONED;
+        list_add_tail(&stream_callbacks, &wrapper->entry);
+        pthread_cond_signal(&stream_callback_request);
+        wrapper = NULL;
+    }
+    else num_stream_callbacks--;
+    pthread_mutex_unlock(&stream_callback_mutex);
+    free(wrapper);
+}
+
 /* Runs on a thread of the Linux driver, which has no Wine thread state, so the Windows callback
- * runs on the worker thread instead and this waits for it. */
-static void run_on_callback_worker(struct stream_callback_entry *wrapper)
+ * runs on the worker thread instead and this waits for it. A callback counted when it was queued
+ * passes FALSE; a call of a host node, which can run any number of times, counts itself here. */
+static void run_on_callback_worker(struct stream_callback_entry *wrapper, BOOL count)
 {
     wrapper->status = STREAM_CALLBACK_PENDING;
     pthread_mutex_lock(&stream_callback_mutex);
 
+    if (count)
+        num_stream_callbacks++;
     list_add_tail(&stream_callbacks, &wrapper->entry);
     pthread_cond_signal(&stream_callback_request);
     while (wrapper->status == STREAM_CALLBACK_PENDING)
         pthread_cond_wait(&stream_callback_reply, &stream_callback_mutex);
 
     pthread_mutex_unlock(&stream_callback_mutex);
-    free(wrapper);
 }
 
 static void stream_callback_wrapper(CUstream hStream, CUresult status, void *userData)
@@ -2957,12 +2997,14 @@ static void stream_callback_wrapper(CUstream hStream, CUresult status, void *use
     struct stream_callback_entry *wrapper = userData;
     wrapper->args.stream = hStream;
     wrapper->args.status = status;
-    run_on_callback_worker(wrapper);
+    run_on_callback_worker(wrapper, FALSE);
+    free(wrapper);
 }
 
 static void host_fn_wrapper(void *userData)
 {
-    run_on_callback_worker(userData);
+    run_on_callback_worker(userData, FALSE);
+    free(userData);
 }
 
 /* Queues one callback for the worker thread, starting the thread if none runs. launch hands the
@@ -2973,39 +3015,185 @@ static CUresult queue_callback(struct stream_callback_entry *wrapper,
 {
     CUresult ret;
 
-    /* spawn a new worker thread if necessary */
-    pthread_mutex_lock(&stream_callback_mutex);
-    if (!num_stream_callbacks++)
+    if (!start_callback_worker())
     {
-        HANDLE thread = CreateThread(NULL, 0, stream_callback_worker_thread, NULL, 0, NULL);
-        if (!thread)
-        {
-            num_stream_callbacks--;
-            pthread_mutex_unlock(&stream_callback_mutex);
-            free(wrapper);
-            return CUDA_ERROR_OUT_OF_MEMORY; /* FIXME */
-        }
-        CloseHandle(thread);
+        free(wrapper);
+        return CUDA_ERROR_OUT_OF_MEMORY; /* FIXME */
     }
-    pthread_mutex_unlock(&stream_callback_mutex);
 
     ret = launch(wrapper, context);
     if (ret)
-    {
-        pthread_mutex_lock(&stream_callback_mutex);
-        if (num_stream_callbacks == 1)
-        {
-            wrapper->status = STREAM_CALLBACK_ABANDONED;
-            list_add_tail(&stream_callbacks, &wrapper->entry);
-            pthread_cond_signal(&stream_callback_request);
-            wrapper = NULL;
-        }
-        else num_stream_callbacks--;
-        pthread_mutex_unlock(&stream_callback_mutex);
-        free(wrapper);
-    }
+        abandon_callback(wrapper);
 
     return ret;
+}
+
+/* A host node runs each time its graph is launched, and clones and executable graphs made from
+ * the graph run it too. So the driver gets host_node_wrapper with a wrapper that lives as long as
+ * any of them, and each call copies the Windows function and argument into an entry of its own.
+ * Each wrapper counts as a callback, which keeps the worker thread running while it lives. */
+static void host_node_wrapper(void *userData)
+{
+    const struct stream_callback_entry *node = userData;
+    struct stream_callback_entry call = { .hostfn = node->hostfn, .args.userdata = node->args.userdata };
+
+    run_on_callback_worker(&call, TRUE);
+}
+
+/* The destructor of the user object that owns a host node wrapper. The driver calls it on a
+ * thread of its own once no graph holds the wrapper. */
+static void host_node_destroy(void *userData)
+{
+    abandon_callback(userData);
+}
+
+/* An executable graph cannot own a user object, so a host function set on one gets a wrapper that
+ * is never freed. One wrapper serves each pair of function and argument. */
+static struct list     static_host_nodes       = LIST_INIT( static_host_nodes );
+static pthread_mutex_t static_host_nodes_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static struct stream_callback_entry *get_static_host_node(void *fn, void *userData)
+{
+    struct stream_callback_entry *node;
+
+    pthread_mutex_lock(&static_host_nodes_mutex);
+    LIST_FOR_EACH_ENTRY(node, &static_host_nodes, struct stream_callback_entry, entry)
+        if (node->hostfn == fn && node->args.userdata == userData) goto done;
+
+    if ((node = calloc(1, sizeof(*node))))
+    {
+        if (start_callback_worker())
+        {
+            node->hostfn        = fn;
+            node->args.userdata = userData;
+            list_add_tail(&static_host_nodes, &node->entry);
+        }
+        else
+        {
+            free(node);
+            node = NULL;
+        }
+    }
+done:
+    pthread_mutex_unlock(&static_host_nodes_mutex);
+    return node;
+}
+
+/* CUDA_HOST_NODE_PARAMS, and CUgraphNodeParams as far as host nodes need it, from cuda.h. */
+struct host_node_params
+{
+    void *fn;
+    void *userData;
+};
+
+struct graph_node_params
+{
+    int type;
+    int reserved0[3];
+    union
+    {
+        long long reserved1[29];
+        struct host_node_params host;
+    };
+    long long reserved2;
+};
+C_ASSERT(sizeof(struct graph_node_params) == 256);
+
+#define CU_GRAPH_NODE_TYPE_HOST             3
+#define CU_STREAM_CAPTURE_STATUS_ACTIVE     1
+#define CU_USER_OBJECT_NO_DESTRUCTOR_SYNC   1
+#define CU_GRAPH_USER_OBJECT_MOVE           1
+
+/* Puts host_node_wrapper into params in place of the Windows function. With a graph, the wrapper
+ * gets a user object in *object, which finish_host_params hands to the graph. Without one, as for
+ * an executable graph, the wrapper is never freed. */
+static CUresult wrap_host_params(CUgraph graph, struct host_node_params *params, void **object)
+{
+    struct stream_callback_entry *node;
+    CUresult ret;
+
+    *object = NULL;
+    if (!params->fn)
+        return CUDA_SUCCESS; /* the driver reports the error */
+
+    if (!graph)
+    {
+        if (!(node = get_static_host_node(params->fn, params->userData)))
+            return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    else
+    {
+        if (!(node = calloc(1, sizeof(*node))))
+            return CUDA_ERROR_OUT_OF_MEMORY;
+        if (!start_callback_worker())
+        {
+            free(node);
+            return CUDA_ERROR_OUT_OF_MEMORY;
+        }
+        node->hostfn        = params->fn;
+        node->args.userdata = params->userData;
+        if ((ret = pcuUserObjectCreate(object, node, host_node_destroy, 1, CU_USER_OBJECT_NO_DESTRUCTOR_SYNC)))
+        {
+            *object = NULL;
+            abandon_callback(node);
+            return ret;
+        }
+    }
+
+    TRACE("host node %p(%p) runs through wrapper %p\n", params->fn, params->userData, node);
+    params->fn       = host_node_wrapper;
+    params->userData = node;
+    return CUDA_SUCCESS;
+}
+
+/* Gives the user object from wrap_host_params to the graph once the driver took the node, or
+ * destroys it if the driver refused. */
+static void finish_host_params(CUgraph graph, void *object, CUresult ret)
+{
+    if (!object)
+        return;
+    if (ret)
+        pcuUserObjectRelease(object, 1);
+    else if (pcuGraphRetainUserObject(graph, object, 1, CU_GRAPH_USER_OBJECT_MOVE))
+        ERR("graph %p did not take user object %p, its host node wrapper leaks\n", graph, object);
+}
+
+/* As wrap_host_params, for CUgraphNodeParams. *params is what to pass to the driver. */
+static CUresult wrap_node_params(CUgraph graph, const void *in, struct graph_node_params *copy,
+                                 void **params, void **object)
+{
+    const struct graph_node_params *node_params = in;
+
+    *object = NULL;
+    *params = (void *)in;
+    if (!node_params || node_params->type != CU_GRAPH_NODE_TYPE_HOST)
+        return CUDA_SUCCESS;
+
+    *copy = *node_params;
+    *params = copy;
+    return wrap_host_params(graph, &copy->host, object);
+}
+
+/* Puts the Windows function back into host node parameters read from the driver. */
+static void unwrap_host_params(struct host_node_params *params)
+{
+    const struct stream_callback_entry *node = params->userData;
+
+    if (params->fn != host_node_wrapper)
+        return;
+    params->fn       = node->hostfn;
+    params->userData = node->args.userdata;
+}
+
+/* The graph that owns a node, so that a new host node wrapper can be given to it. NULL if the
+ * driver cannot say, and the wrapper is then never freed. */
+static CUgraph node_graph(CUgraphNode node)
+{
+    CUgraph graph;
+
+    if (!pcuGraphNodeGetContainingGraph || pcuGraphNodeGetContainingGraph(node, &graph))
+        return NULL;
+    return graph;
 }
 
 struct stream_add_callback_args
@@ -3041,21 +3229,45 @@ struct launch_host_func_args
     CUresult (*func_v2)(CUstream, CUhostFn, void *, unsigned int);
     CUstream stream;
     unsigned int sync_mode;
+    CUresult (*capture_info)(CUstream, CUstreamCaptureStatus *, cuuint64_t *, CUgraph *,
+                             const CUgraphNode **, size_t *);
 };
+
+static CUresult call_launch_host_func(struct launch_host_func_args *args, CUhostFn fn, void *userData)
+{
+    if (args->func_v2)
+        return args->func_v2(args->stream, fn, userData, args->sync_mode);
+    return args->func(args->stream, fn, userData);
+}
 
 static CUresult launch_host_fn(struct stream_callback_entry *wrapper, void *context)
 {
-    struct launch_host_func_args *args = context;
-    if (args->func_v2)
-        return args->func_v2(args->stream, host_fn_wrapper, wrapper, args->sync_mode);
-    return args->func(args->stream, host_fn_wrapper, wrapper);
+    return call_launch_host_func(context, host_fn_wrapper, wrapper);
 }
 
 /* The driver calls a host function on a thread of its own, so the Windows function goes through
- * the callback worker, as for cuStreamAddCallback. */
+ * the callback worker, as for cuStreamAddCallback. On a capturing stream the function becomes a
+ * host node of the captured graph and runs at each launch of it, so it gets a host node wrapper
+ * owned by that graph instead of a wrapper freed after one call. */
 static CUresult launch_host_func(struct launch_host_func_args *args, void *fn, void *userData)
 {
     struct stream_callback_entry *wrapper;
+    CUstreamCaptureStatus status;
+    CUgraph graph;
+
+    if (!args->capture_info(args->stream, &status, NULL, &graph, NULL, NULL) &&
+        status == CU_STREAM_CAPTURE_STATUS_ACTIVE)
+    {
+        struct host_node_params params = { fn, userData };
+        void *object;
+        CUresult ret;
+
+        if ((ret = wrap_host_params(graph, &params, &object)))
+            return ret;
+        ret = call_launch_host_func(args, params.fn, params.userData);
+        finish_host_params(graph, object, ret);
+        return ret;
+    }
 
     wrapper = calloc(1, sizeof(*wrapper));
     if (!wrapper)
@@ -4110,7 +4322,18 @@ CUresult WINAPI wine_cuGraphAddKernelNode(CUgraphNode *phGraphNode, CUgraph hGra
 CUresult WINAPI wine_cuGraphAddHostNode(CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies, size_t numDependencies, const CUDA_NODE_PARAMS *nodeParams)
 {
     TRACE("(%p, %p, %p, %zu, %p)\n", phGraphNode, hGraph, dependencies, numDependencies, nodeParams);
-    return pcuGraphAddHostNode(phGraphNode, hGraph, dependencies, numDependencies, nodeParams);
+    struct host_node_params params;
+    void *object;
+    CUresult ret;
+
+    if (!nodeParams)
+        return pcuGraphAddHostNode(phGraphNode, hGraph, dependencies, numDependencies, nodeParams);
+    params = *(const struct host_node_params *)nodeParams;
+    if ((ret = wrap_host_params(hGraph, &params, &object)))
+        return ret;
+    ret = pcuGraphAddHostNode(phGraphNode, hGraph, dependencies, numDependencies, (const CUDA_NODE_PARAMS *)&params);
+    finish_host_params(hGraph, object, ret);
+    return ret;
 }
 
 CUresult WINAPI wine_cuGraphGetNodes(CUgraph hGraph, CUgraphNode *nodes, size_t *numNodes)
@@ -4199,14 +4422,14 @@ CUresult WINAPI wine_cuMemGetAllocationGranularity(size_t *granularity, const CU
 
 CUresult WINAPI wine_cuLaunchHostFunc(CUstream hStream, CUhostFn fn, void *userData)
 {
-    struct launch_host_func_args args = { pcuLaunchHostFunc, NULL, hStream, 0 };
+    struct launch_host_func_args args = { pcuLaunchHostFunc, NULL, hStream, 0, pcuStreamGetCaptureInfo_v2 };
     TRACE("(%p, %p, %p)\n", hStream, fn, userData);
     return launch_host_func(&args, fn, userData);
 }
 
 CUresult WINAPI wine_cuLaunchHostFunc_ptsz(CUstream hStream, CUhostFn fn, void *userData)
 {
-    struct launch_host_func_args args = { pcuLaunchHostFunc_ptsz, NULL, hStream, 0 };
+    struct launch_host_func_args args = { pcuLaunchHostFunc_ptsz, NULL, hStream, 0, pcuStreamGetCaptureInfo_v2_ptsz };
     TRACE("(%p, %p, %p)\n", hStream, fn, userData);
     return launch_host_func(&args, fn, userData);
 }
@@ -4383,13 +4606,29 @@ CUresult WINAPI wine_cuGraphMemsetNodeSetParams(CUgraphNode hNode, const void *n
 CUresult WINAPI wine_cuGraphHostNodeGetParams(CUgraphNode hNode, void *nodeParams)
 {
     TRACE("(%p, %p)\n", hNode, nodeParams);
-    return pcuGraphHostNodeGetParams(hNode, nodeParams);
+    CUresult ret = pcuGraphHostNodeGetParams(hNode, nodeParams);
+    if (!ret && nodeParams)
+        unwrap_host_params(nodeParams);
+    return ret;
 }
 
 CUresult WINAPI wine_cuGraphHostNodeSetParams(CUgraphNode hNode, const void *nodeParams)
 {
     TRACE("(%p, %p)\n", hNode, nodeParams);
-    return pcuGraphHostNodeSetParams(hNode, nodeParams);
+    struct host_node_params params;
+    CUgraph graph;
+    void *object;
+    CUresult ret;
+
+    if (!nodeParams)
+        return pcuGraphHostNodeSetParams(hNode, nodeParams);
+    params = *(const struct host_node_params *)nodeParams;
+    graph = node_graph(hNode);
+    if ((ret = wrap_host_params(graph, &params, &object)))
+        return ret;
+    ret = pcuGraphHostNodeSetParams(hNode, &params);
+    finish_host_params(graph, object, ret);
+    return ret;
 }
 
 CUresult WINAPI wine_cuGraphAddChildGraphNode(CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies, size_t numDependencies, CUgraph childGraph)
@@ -4473,7 +4712,16 @@ CUresult WINAPI wine_cuGraphExecMemsetNodeSetParams(CUgraphExec hGraphExec, CUgr
 CUresult WINAPI wine_cuGraphExecHostNodeSetParams(CUgraphExec hGraphExec, CUgraphNode hNode, const void *nodeParams)
 {
     TRACE("(%p, %p, %p)\n", hGraphExec, hNode, nodeParams);
-    return pcuGraphExecHostNodeSetParams(hGraphExec, hNode, nodeParams);
+    struct host_node_params params;
+    void *object;
+    CUresult ret;
+
+    if (!nodeParams)
+        return pcuGraphExecHostNodeSetParams(hGraphExec, hNode, nodeParams);
+    params = *(const struct host_node_params *)nodeParams;
+    if ((ret = wrap_host_params(NULL, &params, &object)))
+        return ret;
+    return pcuGraphExecHostNodeSetParams(hGraphExec, hNode, &params);
 }
 
 CUresult WINAPI wine_cuThreadExchangeStreamCaptureMode(CUstreamCaptureMode *mode)
@@ -5028,10 +5276,35 @@ CUresult WINAPI wine_cuGraphDebugDotPrint(CUgraph hGraph, const char *path, unsi
     return pcuGraphDebugDotPrint(hGraph, path, flags);
 }
 
+struct user_object_create_args
+{
+    void *object_out;
+    unsigned int refcount;
+    unsigned int flags;
+};
+
+static CUresult launch_user_object_create(struct stream_callback_entry *wrapper, void *context)
+{
+    struct user_object_create_args *args = context;
+    return pcuUserObjectCreate(args->object_out, wrapper, host_fn_wrapper, args->refcount, args->flags);
+}
+
+/* The driver calls the destructor once, on a thread of its own, so it goes through the callback
+ * worker like a host function. */
 CUresult WINAPI wine_cuUserObjectCreate(void *object_out, void *ptr, CUhostFn destroy, unsigned int initialRefcount, unsigned int flags)
 {
     TRACE("(%p, %p, %p, %u, %u)\n", object_out, ptr, destroy, initialRefcount, flags);
-    return pcuUserObjectCreate(object_out, ptr, destroy, initialRefcount, flags);
+    struct user_object_create_args args = { object_out, initialRefcount, flags };
+    struct stream_callback_entry *wrapper;
+
+    if (!destroy)
+        return pcuUserObjectCreate(object_out, ptr, destroy, initialRefcount, flags);
+    wrapper = calloc(1, sizeof(*wrapper));
+    if (!wrapper)
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    wrapper->hostfn         = (void *)destroy;
+    wrapper->args.userdata  = ptr;
+    return queue_callback(wrapper, launch_user_object_create, &args);
 }
 
 CUresult WINAPI wine_cuUserObjectRetain(void *object, unsigned int count)
@@ -5548,22 +5821,46 @@ CUresult WINAPI wine_cuMemPrefetchAsync_v2_ptsz(CUdeviceptr_v2 devPtr, size_t co
 CUresult WINAPI wine_cuGraphAddNode(CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies, size_t numDependencies, void *nodeParams)
 {
     TRACE("(%p, %p, %p, %zu, %p\n", phGraphNode, hGraph, dependencies, numDependencies, nodeParams);
+    struct graph_node_params copy;
+    void *params, *object;
+    CUresult ret;
+
     CHECK_FUNCPTR(cuGraphAddNode);
-    return pcuGraphAddNode(phGraphNode, hGraph, dependencies, numDependencies, nodeParams);
+    if ((ret = wrap_node_params(hGraph, nodeParams, &copy, &params, &object)))
+        return ret;
+    ret = pcuGraphAddNode(phGraphNode, hGraph, dependencies, numDependencies, params);
+    finish_host_params(hGraph, object, ret);
+    return ret;
 }
 
 CUresult WINAPI wine_cuGraphNodeSetParams(CUgraphNode hNode, void *nodeParams)
 {
     TRACE("(%p, %p\n", hNode, nodeParams);
+    struct graph_node_params copy;
+    void *params, *object;
+    CUgraph graph;
+    CUresult ret;
+
     CHECK_FUNCPTR(cuGraphNodeSetParams);
-    return pcuGraphNodeSetParams(hNode, nodeParams);
+    graph = node_graph(hNode);
+    if ((ret = wrap_node_params(graph, nodeParams, &copy, &params, &object)))
+        return ret;
+    ret = pcuGraphNodeSetParams(hNode, params);
+    finish_host_params(graph, object, ret);
+    return ret;
 }
 
 CUresult WINAPI wine_cuGraphExecNodeSetParams(CUgraphExec hGraphExec, CUgraphNode hNode, void *nodeParams)
 {
     TRACE("%p, %p, %p\n", hGraphExec, hNode, nodeParams);
+    struct graph_node_params copy;
+    void *params, *object;
+    CUresult ret;
+
     CHECK_FUNCPTR(cuGraphExecNodeSetParams);
-    return pcuGraphExecNodeSetParams(hGraphExec, hNode, nodeParams);
+    if ((ret = wrap_node_params(NULL, nodeParams, &copy, &params, &object)))
+        return ret;
+    return pcuGraphExecNodeSetParams(hGraphExec, hNode, params);
 }
 
 CUresult WINAPI wine_cuKernelGetName(const char **name, void *hfunc)
@@ -5662,8 +5959,16 @@ CUresult WINAPI wine_cuStreamUpdateCaptureDependencies_v2_ptsz(CUstream hStream,
 CUresult WINAPI wine_cuGraphAddNode_v2(CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies, const void *dependencyData, size_t numDependencies, void *nodeParams)
 {
     TRACE("(%p, %p, %p, %p, %zu, %p)\n", phGraphNode, hGraph, dependencies, dependencyData, numDependencies, nodeParams);
+    struct graph_node_params copy;
+    void *params, *object;
+    CUresult ret;
+
     CHECK_FUNCPTR(cuGraphAddNode_v2);
-    return pcuGraphAddNode_v2(phGraphNode, hGraph, dependencies, dependencyData, numDependencies, nodeParams);
+    if ((ret = wrap_node_params(hGraph, nodeParams, &copy, &params, &object)))
+        return ret;
+    ret = pcuGraphAddNode_v2(phGraphNode, hGraph, dependencies, dependencyData, numDependencies, params);
+    finish_host_params(hGraph, object, ret);
+    return ret;
 }
 
 CUresult WINAPI wine_cuGraphConditionalHandleCreate(void *pHandle_out, CUgraph hGraph, CUcontext ctx, unsigned int defaultLaunchValue, unsigned int flags)
@@ -6326,8 +6631,14 @@ CUresult WINAPI wine_cuFuncGetParamCount(CUfunction func, size_t* paramCount)
 CUresult WINAPI wine_cuGraphNodeGetParams(CUgraphNode hNode, CUgraphNodeParams* nodeParams)
 {
     TRACE("(%p, %p)\n", hNode, nodeParams);
+    struct graph_node_params *params = (struct graph_node_params *)nodeParams;
+    CUresult ret;
+
     CHECK_FUNCPTR(cuGraphNodeGetParams);
-    return pcuGraphNodeGetParams(hNode, nodeParams);
+    ret = pcuGraphNodeGetParams(hNode, nodeParams);
+    if (!ret && params && params->type == CU_GRAPH_NODE_TYPE_HOST)
+        unwrap_host_params(&params->host);
+    return ret;
 }
 
 CUresult WINAPI wine_cuMemcpyWithAttributesAsync(CUdeviceptr_v2 dst, CUdeviceptr_v2 src, size_t size, CUmemcpyAttributes_v1* attr, CUstream hStream)
@@ -6382,7 +6693,7 @@ CUresult WINAPI wine_cuCoredumpDeregisterCompleteCallback(CUcoredumpCallbackHand
 CUresult WINAPI wine_cuLaunchHostFunc_v2(CUstream hStream, CUhostFn fn, void* userData, unsigned int syncMode)
 {
     TRACE("(%p, %p, %p, %u)\n", hStream, fn, userData, syncMode);
-    struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2, hStream, syncMode };
+    struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2, hStream, syncMode, pcuStreamGetCaptureInfo_v2 };
     CHECK_FUNCPTR(cuLaunchHostFunc_v2);
     return launch_host_func(&args, fn, userData);
 }
@@ -6390,7 +6701,7 @@ CUresult WINAPI wine_cuLaunchHostFunc_v2(CUstream hStream, CUhostFn fn, void* us
 CUresult WINAPI wine_cuLaunchHostFunc_v2_ptsz(CUstream hStream, CUhostFn fn, void* userData, unsigned int syncMode)
 {
     TRACE("(%p, %p, %p, %u)\n", hStream, fn, userData, syncMode);
-    struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2_ptsz, hStream, syncMode };
+    struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2_ptsz, hStream, syncMode, pcuStreamGetCaptureInfo_v2_ptsz };
     CHECK_FUNCPTR(cuLaunchHostFunc_v2_ptsz);
     return launch_host_func(&args, fn, userData);
 }
@@ -6496,15 +6807,33 @@ CUresult WINAPI wine_cuStreamBeginRecaptureToGraph_ptsz(CUstream hStream, CUstre
 CUresult WINAPI wine_cuGraphAddNode_v3(CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies, const void *dependencyData, size_t numDependencies, void *nodeParams)
 {
     TRACE("(%p, %p, %p, %p, %zu, %p)\n", phGraphNode, hGraph, dependencies, dependencyData, numDependencies, nodeParams);
+    struct graph_node_params copy;
+    void *params, *object;
+    CUresult ret;
+
     CHECK_FUNCPTR(cuGraphAddNode_v3);
-    return pcuGraphAddNode_v3(phGraphNode, hGraph, dependencies, dependencyData, numDependencies, nodeParams);
+    if ((ret = wrap_node_params(hGraph, nodeParams, &copy, &params, &object)))
+        return ret;
+    ret = pcuGraphAddNode_v3(phGraphNode, hGraph, dependencies, dependencyData, numDependencies, params);
+    finish_host_params(hGraph, object, ret);
+    return ret;
 }
 
 CUresult WINAPI wine_cuGraphNodeSetParams_v2(CUgraphNode hNode, void *nodeParams)
 {
     TRACE("(%p, %p)\n", hNode, nodeParams);
+    struct graph_node_params copy;
+    void *params, *object;
+    CUgraph graph;
+    CUresult ret;
+
     CHECK_FUNCPTR(cuGraphNodeSetParams_v2);
-    return pcuGraphNodeSetParams_v2(hNode, nodeParams);
+    graph = node_graph(hNode);
+    if ((ret = wrap_node_params(graph, nodeParams, &copy, &params, &object)))
+        return ret;
+    ret = pcuGraphNodeSetParams_v2(hNode, params);
+    finish_host_params(graph, object, ret);
+    return ret;
 }
 
 CUresult WINAPI wine_cuDeviceGetFabricClusterUuid(CUuuid* uuid, CUdevice dev)
