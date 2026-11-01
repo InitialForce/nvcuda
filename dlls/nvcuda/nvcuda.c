@@ -3124,9 +3124,10 @@ struct host_node_owner
     CUgraph graph;
     void *object;
     struct stream_callback_entry *wrapper;
-    /* While a stream capture adds nodes: the stream, and the thread for a per-thread stream. */
-    CUstream capture_stream;
-    DWORD capture_thread;
+    /* While the stream capture that added the node runs: its id, which every stream joined to
+     * the capture shares. */
+    BOOL in_capture;
+    cuuint64_t capture_id;
     struct host_node_owner *next; /* for remove_host_nodes */
 };
 
@@ -3157,8 +3158,8 @@ static struct host_node_owner *get_host_node_owner(CUgraphNode node)
 /* Records that node owns object and wrapper. Returns the user object the node owned before in
  * the same graph, whose graph reference the caller gives back. */
 static void *set_host_node_owner(CUgraphNode node, CUgraph graph, void *object,
-                                 struct stream_callback_entry *wrapper, CUstream capture_stream,
-                                 DWORD capture_thread)
+                                 struct stream_callback_entry *wrapper, BOOL in_capture,
+                                 cuuint64_t capture_id)
 {
     struct host_node_owner *owner;
     void *old = NULL;
@@ -3181,10 +3182,10 @@ static void *set_host_node_owner(CUgraphNode node, CUgraph graph, void *object,
         owner->graph          = graph;
         owner->object         = object;
         owner->wrapper        = wrapper;
-        if (capture_stream) /* a change during capture leaves the node to its capture */
+        if (in_capture) /* a change during capture leaves the node to its capture */
         {
-            owner->capture_stream = capture_stream;
-            owner->capture_thread = capture_thread;
+            owner->in_capture = TRUE;
+            owner->capture_id = capture_id;
         }
     }
     return old;
@@ -3208,19 +3209,19 @@ static void *remove_host_node_owner(CUgraphNode node, CUgraph *graph)
 }
 
 /* Forgets the owners of the nodes of a destroyed graph, which gave back its references. With
- * stream set instead, does that for the nodes an ended capture on that stream added; if the
- * capture failed, the driver destroyed its graph. If it worked, the nodes stay. */
-static void remove_host_nodes(CUgraph graph, CUstream stream, DWORD thread, BOOL failed)
+ * by_capture set instead, does that for the nodes an ended capture added on any of its streams;
+ * if the capture failed, the driver destroyed its graph. If it worked, the nodes stay. */
+static void remove_host_nodes(CUgraph graph, BOOL by_capture, cuuint64_t capture_id, BOOL failed)
 {
     struct host_node_owner *owner, *list = NULL;
     unsigned int count = 0;
 
     RB_FOR_EACH_ENTRY(owner, &host_node_owners, struct host_node_owner, entry)
     {
-        if (stream)
+        if (by_capture)
         {
-            if (owner->capture_stream != stream || owner->capture_thread != thread) continue;
-            owner->capture_stream = NULL;
+            if (!owner->in_capture || owner->capture_id != capture_id) continue;
+            owner->in_capture = FALSE;
             if (!failed) continue;
         }
         else if (owner->graph != graph) continue;
@@ -3235,20 +3236,85 @@ static void remove_host_nodes(CUgraph graph, CUstream stream, DWORD thread, BOOL
         num_host_node_owners--;
         count++;
     }
-    if (stream && failed)
-        TRACE("capture on %p failed, forgot %u host nodes, %u left\n", stream, count, num_host_node_owners);
+    if (by_capture && failed)
+        TRACE("capture %s failed, forgot %u host nodes, %u left\n", wine_dbgstr_longlong(capture_id),
+              count, num_host_node_owners);
 }
 
-/* The key of a capturing stream: a per-thread default stream is a different stream on each thread. */
-static CUstream capture_stream_key(CUstream stream, DWORD *thread)
+/* The capture each stream began, by its id. The driver gives the id only while the capture is
+ * active, and cuStreamEndCapture needs it after an error has invalidated the capture. */
+struct capture_origin
+{
+    struct list entry;
+    CUstream stream;
+    DWORD thread;
+    cuuint64_t id;
+};
+
+static struct list capture_origins = LIST_INIT( capture_origins );
+
+/* The key of a stream. NULL is the legacy stream, or the per-thread stream in a _ptsz entry
+ * point, and a per-thread stream is a different stream on each thread. */
+static CUstream capture_stream_key(CUstream stream, BOOL per_thread_default, DWORD *thread)
 {
     *thread = 0;
-    if (!stream || stream == (CUstream)0x2 /* CU_STREAM_PER_THREAD */)
-    {
+    if (!stream)
+        stream = per_thread_default ? (CUstream)0x2 /* CU_STREAM_PER_THREAD */ : (CUstream)0x1 /* CU_STREAM_LEGACY */;
+    if (stream == (CUstream)0x2)
         *thread = GetCurrentThreadId();
-        return (CUstream)0x2;
-    }
     return stream;
+}
+
+static struct capture_origin *get_capture_origin(CUstream stream, BOOL per_thread_default)
+{
+    struct capture_origin *origin;
+    DWORD thread;
+
+    stream = capture_stream_key(stream, per_thread_default, &thread);
+    LIST_FOR_EACH_ENTRY(origin, &capture_origins, struct capture_origin, entry)
+        if (origin->stream == stream && origin->thread == thread) return origin;
+    return NULL;
+}
+
+/* After a capture began on stream: remembers its id. Called with the host node lock held. */
+static void add_capture_origin(CUstream stream, BOOL per_thread_default)
+{
+    CUresult (*capture_info)(CUstream, CUstreamCaptureStatus *, cuuint64_t *, CUgraph *,
+                             const CUgraphNode **, size_t *);
+    struct capture_origin *origin;
+    CUstreamCaptureStatus status;
+    cuuint64_t id;
+
+    capture_info = per_thread_default ? pcuStreamGetCaptureInfo_v2_ptsz : pcuStreamGetCaptureInfo_v2;
+    if (capture_info(stream, &status, &id, NULL, NULL, NULL) || status != CU_STREAM_CAPTURE_STATUS_ACTIVE)
+        return;
+    if (!(origin = get_capture_origin(stream, per_thread_default)))
+    {
+        if (!(origin = calloc(1, sizeof(*origin)))) return;
+        origin->stream = capture_stream_key(stream, per_thread_default, &origin->thread);
+        list_add_tail(&capture_origins, &origin->entry);
+    }
+    origin->id = id;
+}
+
+/* cuStreamEndCapture: the driver ends the capture begun on stream, then the records follow. */
+static CUresult end_capture(CUresult (*func)(CUstream, CUgraph *), CUstream stream,
+                            BOOL per_thread_default, CUgraph *graph)
+{
+    struct capture_origin *origin;
+    CUresult ret;
+
+    lock_host_nodes();
+    origin = get_capture_origin(stream, per_thread_default);
+    ret = func(stream, graph);
+    if (origin)
+    {
+        remove_host_nodes(NULL, TRUE, origin->id, ret || !graph || !*graph);
+        list_remove(&origin->entry);
+        free(origin);
+    }
+    unlock_host_nodes();
+    return ret;
 }
 
 /* One change of host node parameters: wrap_host_params before the driver call, finish_host_params
@@ -3259,8 +3325,8 @@ struct host_install
     CUgraphNode node;                       /* the node whose parameters change; NULL for a new node */
     void *object;                           /* new user object, already held by graph */
     struct stream_callback_entry *wrapper;  /* the wrapper object owns */
-    CUstream capture_stream;                /* for a node added by stream capture, as */
-    DWORD capture_thread;                   /* capture_stream_key gives them */
+    BOOL in_capture;                        /* for a node added by stream capture, */
+    cuuint64_t capture_id;                  /* and the capture's id */
 };
 
 /* Puts host_node_wrapper into params in place of the Windows function. With a graph, a new wrapper
@@ -3340,7 +3406,7 @@ static void finish_host_params(struct host_install *install, CUresult ret, CUgra
         return;
     }
     if (node && (old = set_host_node_owner(node, install->graph, install->object, install->wrapper,
-                                            install->capture_stream, install->capture_thread)))
+                                            install->in_capture, install->capture_id)))
         pcuGraphReleaseUserObject(install->graph, old, 1);
 }
 
@@ -3445,9 +3511,10 @@ static CUresult launch_host_func(struct launch_host_func_args *args, void *fn, v
 {
     struct stream_callback_entry *wrapper;
     CUstreamCaptureStatus status;
+    cuuint64_t capture_id;
     CUgraph graph;
 
-    if (!args->capture_info(args->stream, &status, NULL, &graph, NULL, NULL) &&
+    if (!args->capture_info(args->stream, &status, &capture_id, &graph, NULL, NULL) &&
         status == CU_STREAM_CAPTURE_STATUS_ACTIVE)
     {
         struct host_node_params params = { fn, userData };
@@ -3457,7 +3524,8 @@ static CUresult launch_host_func(struct launch_host_func_args *args, void *fn, v
         size_t count;
         CUresult ret;
 
-        install.capture_stream = capture_stream_key(args->stream, &install.capture_thread);
+        install.in_capture = TRUE;
+        install.capture_id = capture_id;
         lock_host_nodes();
         if (!(ret = wrap_host_params(&install, &params)))
         {
@@ -4580,43 +4648,37 @@ CUresult WINAPI wine_cuGraphExecKernelNodeSetParams(CUgraphExec hGraphExec, CUgr
 CUresult WINAPI wine_cuStreamBeginCapture_v2(CUstream hStream, CUstreamCaptureMode mode)
 {
     TRACE("(%p, %d)\n", hStream, mode);
-    return pcuStreamBeginCapture_v2(hStream, mode);
+    CUresult ret;
+
+    lock_host_nodes();
+    if (!(ret = pcuStreamBeginCapture_v2(hStream, mode)))
+        add_capture_origin(hStream, FALSE);
+    unlock_host_nodes();
+    return ret;
 }
 
 CUresult WINAPI wine_cuStreamBeginCapture_v2_ptsz(CUstream hStream, CUstreamCaptureMode mode)
 {
     TRACE("(%p, %d)\n", hStream, mode);
-    return pcuStreamBeginCapture_v2_ptsz(hStream, mode);
+    CUresult ret;
+
+    lock_host_nodes();
+    if (!(ret = pcuStreamBeginCapture_v2_ptsz(hStream, mode)))
+        add_capture_origin(hStream, TRUE);
+    unlock_host_nodes();
+    return ret;
 }
 
 CUresult WINAPI wine_cuStreamEndCapture(CUstream hStream, CUgraph *phGraph)
 {
     TRACE("(%p, %p)\n", hStream, phGraph);
-    CUstream stream;
-    DWORD thread;
-    CUresult ret;
-
-    lock_host_nodes();
-    ret = pcuStreamEndCapture(hStream, phGraph);
-    stream = capture_stream_key(hStream, &thread);
-    remove_host_nodes(NULL, stream, thread, ret || !phGraph || !*phGraph);
-    unlock_host_nodes();
-    return ret;
+    return end_capture(pcuStreamEndCapture, hStream, FALSE, phGraph);
 }
 
 CUresult WINAPI wine_cuStreamEndCapture_ptsz(CUstream hStream, CUgraph *phGraph)
 {
     TRACE("(%p, %p)\n", hStream, phGraph);
-    CUstream stream;
-    DWORD thread;
-    CUresult ret;
-
-    lock_host_nodes();
-    ret = pcuStreamEndCapture_ptsz(hStream, phGraph);
-    stream = capture_stream_key(hStream, &thread);
-    remove_host_nodes(NULL, stream, thread, ret || !phGraph || !*phGraph);
-    unlock_host_nodes();
-    return ret;
+    return end_capture(pcuStreamEndCapture_ptsz, hStream, TRUE, phGraph);
 }
 
 CUresult WINAPI wine_cuGraphDestroyNode(CUgraphNode hNode)
@@ -4640,7 +4702,7 @@ CUresult WINAPI wine_cuGraphDestroy(CUgraph hGraph)
 
     lock_host_nodes();
     if (!(ret = pcuGraphDestroy(hGraph)))
-        remove_host_nodes(hGraph, NULL, 0, FALSE);
+        remove_host_nodes(hGraph, FALSE, 0, FALSE);
     unlock_host_nodes();
     return ret;
 }
@@ -4984,13 +5046,25 @@ CUresult WINAPI wine_cuMemSetAccess(CUdeviceptr_v2 ptr, size_t size, const void 
 CUresult WINAPI wine_cuStreamBeginCapture(CUstream hStream)
 {
     TRACE("(%p)\n", hStream);
-    return pcuStreamBeginCapture(hStream);
+    CUresult ret;
+
+    lock_host_nodes();
+    if (!(ret = pcuStreamBeginCapture(hStream)))
+        add_capture_origin(hStream, FALSE);
+    unlock_host_nodes();
+    return ret;
 }
 
 CUresult WINAPI wine_cuStreamBeginCapture_ptsz(CUstream hStream)
 {
     TRACE("(%p)\n", hStream);
-    return pcuStreamBeginCapture_ptsz(hStream);
+    CUresult ret;
+
+    lock_host_nodes();
+    if (!(ret = pcuStreamBeginCapture_ptsz(hStream)))
+        add_capture_origin(hStream, TRUE);
+    unlock_host_nodes();
+    return ret;
 }
 
 CUresult WINAPI wine_cuMemCreate(CUmemGenericAllocationHandle_v1 *handle, size_t size, const void *prop, unsigned long long flags)
@@ -6163,15 +6237,27 @@ CUresult WINAPI wine_cuGraphRemoveDependencies_v2(CUgraph hGraph, const CUgraphN
 CUresult WINAPI wine_cuStreamBeginCaptureToGraph(CUstream hStream, CUgraph hGraph, const CUgraphNode *dependencies, const void *dependencyData, size_t numDependencies, CUstreamCaptureMode mode)
 {
     TRACE("(%p, %p, %p, %p, %zu, %d)\n", hStream, hGraph, dependencies, dependencyData, numDependencies, mode);
+    CUresult ret;
+
     CHECK_FUNCPTR(cuStreamBeginCaptureToGraph);
-    return pcuStreamBeginCaptureToGraph(hStream, hGraph, dependencies, dependencyData, numDependencies, mode);
+    lock_host_nodes();
+    if (!(ret = pcuStreamBeginCaptureToGraph(hStream, hGraph, dependencies, dependencyData, numDependencies, mode)))
+        add_capture_origin(hStream, FALSE);
+    unlock_host_nodes();
+    return ret;
 }
 
 CUresult WINAPI wine_cuStreamBeginCaptureToGraph_ptsz(CUstream hStream, CUgraph hGraph, const CUgraphNode *dependencies, const void *dependencyData, size_t numDependencies, CUstreamCaptureMode mode)
 {
     TRACE("(%p, %p, %p, %p, %zu, %d)\n", hStream, hGraph, dependencies, dependencyData, numDependencies, mode);
+    CUresult ret;
+
     CHECK_FUNCPTR(cuStreamBeginCaptureToGraph_ptsz);
-    return pcuStreamBeginCaptureToGraph_ptsz(hStream, hGraph, dependencies, dependencyData, numDependencies, mode);
+    lock_host_nodes();
+    if (!(ret = pcuStreamBeginCaptureToGraph_ptsz(hStream, hGraph, dependencies, dependencyData, numDependencies, mode)))
+        add_capture_origin(hStream, TRUE);
+    unlock_host_nodes();
+    return ret;
 }
 
 CUresult WINAPI wine_cuStreamGetCaptureInfo_v3(CUstream hStream, CUstreamCaptureStatus *captureStatus_out, cuuint64_t *id_out, CUgraph *graph_out, const CUgraphNode **dependencies_out,
