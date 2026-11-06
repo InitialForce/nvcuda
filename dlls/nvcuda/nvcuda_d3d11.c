@@ -36,6 +36,7 @@
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <limits.h>
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -97,6 +98,7 @@ struct d3d11_cuda_resource
     ID3D11Buffer *twin;
     ID3D11DeviceContext4 *context;
     ID3D11Fence *fence;
+    ID3D11Multithread *multithread;
     UINT64 fence_value;
     CUexternalMemory_ memory;
     CUexternalSemaphore semaphore;
@@ -179,10 +181,16 @@ static void destroy_resource(struct d3d11_cuda_resource *resource)
     if (resource->semaphore) p_cuDestroyExternalSemaphore(resource->semaphore);
     if (resource->fence) ID3D11Fence_Release(resource->fence);
     if (resource->context) ID3D11DeviceContext4_Release(resource->context);
+    if (resource->multithread) ID3D11Multithread_Release(resource->multithread);
     if (resource->twin) ID3D11Buffer_Release(resource->twin);
     if (resource->buffer) ID3D11Buffer_Release(resource->buffer);
     HeapFree(GetProcessHeap(), 0, resource);
 }
+
+/* CUDA imports a whole Vulkan allocation, so it needs the allocation's size, which D3D11 does not
+ * report. The twin is a whole number of 64 KiB pages, a size that needs no padding, so its size
+ * is the allocation size. Only the first ByteWidth bytes are copied and mapped. */
+#define TWIN_ALIGN 0x10000
 
 static CUresult import_twin_memory(struct d3d11_cuda_resource *resource, ID3D11Device *device,
                                    const D3D11_BUFFER_DESC *desc)
@@ -196,7 +204,8 @@ static CUresult import_twin_memory(struct d3d11_cuda_resource *resource, ID3D11D
     HRESULT hr;
     int fd;
 
-    twin_desc.ByteWidth = desc->ByteWidth;
+    if (desc->ByteWidth > UINT_MAX - (TWIN_ALIGN - 1)) return CUDA_ERROR_INVALID_VALUE;
+    twin_desc.ByteWidth = (desc->ByteWidth + TWIN_ALIGN - 1) & ~(TWIN_ALIGN - 1);
     twin_desc.Usage = D3D11_USAGE_DEFAULT;
     twin_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
 
@@ -220,13 +229,13 @@ static CUresult import_twin_memory(struct d3d11_cuda_resource *resource, ID3D11D
 
     memory_desc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
     memory_desc.handle.fd = fd;
-    memory_desc.size = desc->ByteWidth;
+    memory_desc.size = twin_desc.ByteWidth;
     memory_desc.flags = CUDA_EXTERNAL_MEMORY_DEDICATED_;
 
     /* On success CUDA owns the fd. */
     if ((ret = p_cuImportExternalMemory(&resource->memory, &memory_desc)))
     {
-        ERR("CUDA can't import the twin buffer memory (%u bytes), error %d.\n", desc->ByteWidth, ret);
+        ERR("CUDA can't import the twin buffer memory (%u bytes), error %d.\n", twin_desc.ByteWidth, ret);
         close(fd);
         resource->memory = NULL;
         return ret;
@@ -320,6 +329,7 @@ CUresult d3d11_register_resource(CUgraphicsResource *handle, ID3D11Resource *d3d
     ID3D11Buffer_GetDevice(resource->buffer, &device);
     ID3D11Device_GetImmediateContext(device, &context);
     ID3D11DeviceContext_QueryInterface(context, &IID_ID3D11DeviceContext4, (void **)&resource->context);
+    ID3D11DeviceContext_QueryInterface(context, &IID_ID3D11Multithread, (void **)&resource->multithread);
     ID3D11DeviceContext_Release(context);
 
     if (!resource->context) ret = CUDA_ERROR_NOT_SUPPORTED_;
@@ -365,6 +375,27 @@ CUresult d3d11_unregister_resource(CUgraphicsResource handle)
     return CUDA_SUCCESS_;
 }
 
+/* The immediate context belongs to the application. Its multithread lock (when the application
+ * turned protection on) keeps our calls from running at the same time as the application's. */
+static void lock_context(struct d3d11_cuda_resource *resource)
+{
+    if (resource->multithread) ID3D11Multithread_Enter(resource->multithread);
+}
+
+static void unlock_context(struct d3d11_cuda_resource *resource)
+{
+    if (resource->multithread) ID3D11Multithread_Leave(resource->multithread);
+}
+
+/* Copies the application's ByteWidth bytes between the buffer and the larger twin. */
+static void copy_buffer(struct d3d11_cuda_resource *resource, ID3D11Buffer *dst, ID3D11Buffer *src)
+{
+    D3D11_BOX box = { 0, 0, 0, resource->size, 1, 1 };
+
+    ID3D11DeviceContext4_CopySubresourceRegion(resource->context, (ID3D11Resource *)dst, 0, 0, 0, 0,
+                                               (ID3D11Resource *)src, 0, &box);
+}
+
 CUresult d3d11_map_resource(CUgraphicsResource handle, CUstream stream, BOOL ptsz)
 {
     CUDA_EXTERNAL_SEMAPHORE_PARAMS_ params = {0};
@@ -384,13 +415,22 @@ CUresult d3d11_map_resource(CUgraphicsResource handle, CUstream stream, BOOL pts
         return CUDA_ERROR_ALREADY_MAPPED_;
     }
 
+    lock_context(resource);
     if (!(resource->map_flags & CU_GRAPHICS_MAP_RESOURCE_FLAGS_WRITE_DISCARD))
-        ID3D11DeviceContext4_CopyResource(resource->context, (ID3D11Resource *)resource->twin,
-                                          (ID3D11Resource *)resource->buffer);
-    params.params.fence.value = ++resource->fence_value;
-    if (FAILED(hr = ID3D11DeviceContext4_Signal(resource->context, resource->fence, params.params.fence.value)))
-        ERR("Can't signal the D3D11 fence, hr %#lx.\n", (long)hr);
+        copy_buffer(resource, resource->twin, resource->buffer);
+    params.params.fence.value = resource->fence_value + 1;
+    hr = ID3D11DeviceContext4_Signal(resource->context, resource->fence, params.params.fence.value);
     ID3D11DeviceContext4_Flush(resource->context);
+    unlock_context(resource);
+
+    /* Without the signal, the CUDA wait below would never end. */
+    if (FAILED(hr))
+    {
+        ERR("Can't signal the D3D11 fence, hr %#lx.\n", (long)hr);
+        LeaveCriticalSection(&resources_cs);
+        return CUDA_ERROR_UNKNOWN_;
+    }
+    resource->fence_value++;
 
     if ((ret = p_cuWait[ptsz](&resource->semaphore, &params, 1, stream)))
         ERR("CUDA can't wait for the D3D11 fence, error %d.\n", ret);
@@ -430,16 +470,29 @@ CUresult d3d11_unmap_resource(CUgraphicsResource handle, CUstream stream, BOOL p
     }
     resource->mapped = FALSE;
 
-    /* D3D11 work after this point waits on the GPU until CUDA is done with the twin. */
+    /* D3D11 work after this point waits on the GPU until CUDA is done with the twin. If the
+     * GPU wait can't be queued, wait on the CPU instead, so the copy back never runs early. */
+    lock_context(resource);
     if (FAILED(hr = ID3D11DeviceContext4_Wait(resource->context, resource->fence, params.params.fence.value)))
-        ERR("Can't make D3D11 wait for CUDA, hr %#lx.\n", (long)hr);
-    if (!(resource->map_flags & CU_GRAPHICS_MAP_RESOURCE_FLAGS_READ_ONLY))
-        ID3D11DeviceContext4_CopyResource(resource->context, (ID3D11Resource *)resource->buffer,
-                                          (ID3D11Resource *)resource->twin);
+    {
+        HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
+
+        ERR("Can't make D3D11 wait for CUDA, hr %#lx; waiting on the CPU.\n", (long)hr);
+        if (!event || FAILED(hr = ID3D11Fence_SetEventOnCompletion(resource->fence, params.params.fence.value, event))
+            || WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0)
+        {
+            ERR("Can't wait for CUDA, hr %#lx; the buffer keeps its old contents.\n", (long)hr);
+            ret = CUDA_ERROR_UNKNOWN_;
+        }
+        if (event) CloseHandle(event);
+    }
+    if (!ret && !(resource->map_flags & CU_GRAPHICS_MAP_RESOURCE_FLAGS_READ_ONLY))
+        copy_buffer(resource, resource->buffer, resource->twin);
     ID3D11DeviceContext4_Flush(resource->context);
+    unlock_context(resource);
 
     LeaveCriticalSection(&resources_cs);
-    return CUDA_SUCCESS_;
+    return ret;
 }
 
 CUresult d3d11_get_mapped_pointer(CUdeviceptr *pointer, size_t *size, CUgraphicsResource handle)

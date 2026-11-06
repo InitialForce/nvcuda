@@ -23,6 +23,8 @@
 #include <stdarg.h>
 #include <assert.h>
 #include <inttypes.h>
+#include <string.h>
+#include <unistd.h>
 
 #ifdef HAVE_PTHREAD_H
 #include <pthread.h>
@@ -2102,11 +2104,20 @@ CUresult WINAPI wine_cuGraphicsGLRegisterImage(CUgraphicsResource *pCudaResource
 static CUresult map_resources(unsigned int count, CUgraphicsResource *resources, CUstream hStream, BOOL map, BOOL ptsz)
 {
     CUgraphicsResource driver_resources[64], *driver = driver_resources;
-    unsigned int i, driver_count = 0, done = 0;
+    BOOL done_flags[64], *done = done_flags;
+    unsigned int i, driver_count = 0;
     CUresult ret = CUDA_SUCCESS;
+    BOOL driver_done;
 
-    if (count > ARRAY_SIZE(driver_resources) && !(driver = malloc(count * sizeof(*driver))))
+    if (!count) return CUDA_SUCCESS;
+    if (!resources) return CUDA_ERROR_INVALID_VALUE;
+    if (count > ARRAY_SIZE(driver_resources)
+        && (!(driver = malloc(count * sizeof(*driver))) || !(done = calloc(count, sizeof(*done)))))
+    {
+        free(driver == driver_resources ? NULL : driver);
         return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    if (done == done_flags) memset(done_flags, 0, sizeof(done_flags));
 
     for (i = 0; i < count; i++)
         if (!d3d11_is_resource(resources[i])) driver[driver_count++] = resources[i];
@@ -2119,24 +2130,28 @@ static CUresult map_resources(unsigned int count, CUgraphicsResource *resources,
                         : pcuGraphicsUnmapResources(driver_count, driver, hStream);
     }
 
+    /* When the driver map fails it maps none of its resources, so nothing is undone below. */
+    driver_done = driver_count && !ret;
     for (i = 0; !ret && i < count; i++)
     {
         if (!d3d11_is_resource(resources[i])) continue;
         ret = map ? d3d11_map_resource(resources[i], hStream, ptsz) : d3d11_unmap_resource(resources[i], hStream, ptsz);
-        if (!ret) done++;
+        done[i] = !ret;
     }
 
-    /* A failed map leaves nothing mapped, as with the driver. */
+    /* A failed map leaves nothing mapped that this call mapped, as with the driver. A resource
+     * that was mapped before the call (CUDA_ERROR_ALREADY_MAPPED) stays mapped. */
     if (ret && map)
     {
-        for (i = 0; done && i < count; i++)
-            if (d3d11_is_resource(resources[i]) && !d3d11_unmap_resource(resources[i], hStream, ptsz)) done--;
-        if (driver_count)
+        for (i = 0; i < count; i++)
+            if (done[i]) d3d11_unmap_resource(resources[i], hStream, ptsz);
+        if (driver_done)
             ptsz ? pcuGraphicsUnmapResources_ptsz(driver_count, driver, hStream)
                  : pcuGraphicsUnmapResources(driver_count, driver, hStream);
     }
 
     if (driver != driver_resources) free(driver);
+    if (done != done_flags) free(done);
     return ret;
 }
 
@@ -4310,6 +4325,7 @@ CUresult WINAPI wine_cuImportExternalSemaphore(CUexternalSemaphore *extSem_out, 
     TRACE("(%p, %p, %d)\n", extSem_out, semHandleDesc, semHandleDesc->type);
 
     CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC linuxHandleDesc = *semHandleDesc;
+    BOOL converted = TRUE;
     HANDLE handle;
 
     switch (linuxHandleDesc.type)
@@ -4337,11 +4353,17 @@ CUresult WINAPI wine_cuImportExternalSemaphore(CUexternalSemaphore *extSem_out, 
             linuxHandleDesc.flags = 0;
             break;
         default:
+            converted = FALSE;
             break;
     }
 
     CUresult ret = pcuImportExternalSemaphore(extSem_out, &linuxHandleDesc);
-    if(ret) ERR("Returned error: %d\n", ret);
+    if(ret)
+    {
+        ERR("Returned error: %d\n", ret);
+        /* CUDA owns an imported fd only on success; one this wrapper made is closed here. */
+        if (converted && linuxHandleDesc.handle.fd >= 0) close(linuxHandleDesc.handle.fd);
+    }
 
     return ret;
 }
