@@ -1,6 +1,7 @@
 nvcuda_src = [
   'internal.c',
   'nvcuda.c',
+  'nvcuda_d3d11.c',
   'function_mappings.c',
   'encryption.c',
 ]
