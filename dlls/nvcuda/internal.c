@@ -113,6 +113,41 @@ HANDLE get_shared_resource_kmt_handle(HANDLE shared_resource)
     return wine_server_ptr_handle(kmt_handle);
 }
 
+/* The host fd behind a Wine 11 NT shared handle: a D3DKMT resource (memory) or sync object
+ * (fence). Wine 11 shares GPU objects through D3DKMT objects in wineserver; the Proton
+ * sharedgpures device below does not exist there. */
+int get_d3dkmt_object_fd(HANDLE win32_handle, BOOL sync)
+{
+    obj_handle_t object = 0;
+    NTSTATUS status;
+    int fd = -1;
+
+    SERVER_START_REQ(d3dkmt_object_open)
+    {
+        req->type = sync ? D3DKMT_SYNC : D3DKMT_RESOURCE;
+        req->global = 0;
+        req->handle = wine_server_obj_handle(win32_handle);
+        if (!(status = wine_server_call(req))) object = reply->handle;
+    }
+    SERVER_END_REQ;
+
+    if (status)
+    {
+        TRACE("No D3DKMT %s behind %p, status %#lx.\n", sync ? "sync object" : "resource",
+              win32_handle, (long)status);
+        return -1;
+    }
+
+    status = wine_server_handle_to_fd(wine_server_ptr_handle(object), GENERIC_ALL, &fd, NULL);
+    NtClose(wine_server_ptr_handle(object));
+    if (status)
+    {
+        ERR("Can't get the fd of the D3DKMT object behind %p, status %#lx.\n", win32_handle, (long)status);
+        return -1;
+    }
+    return fd;
+}
+
 int get_shared_resource_fd(HANDLE win32_handle)
 {
     IO_STATUS_BLOCK iosb;
@@ -120,6 +155,9 @@ int get_shared_resource_fd(HANDLE win32_handle)
     NTSTATUS status;
     int unix_fd = -1;
     HANDLE new_handle = NULL;
+
+    if ((unix_fd = get_d3dkmt_object_fd(win32_handle, FALSE)) >= 0) return unix_fd;
+    if ((unix_fd = get_d3dkmt_object_fd(win32_handle, TRUE)) >= 0) return unix_fd;
 
     if(NtDuplicateObject(NtCurrentProcess(), win32_handle, NtCurrentProcess(), &new_handle, 0, 0, DUPLICATE_SAME_ACCESS))
     {

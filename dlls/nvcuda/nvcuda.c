@@ -2101,33 +2101,79 @@ CUresult WINAPI wine_cuGraphicsGLRegisterImage(CUgraphicsResource *pCudaResource
     return pcuGraphicsGLRegisterImage(pCudaResource, image, target, Flags);
 }
 
+/* Maps or unmaps a mix of D3D11 resources (nvcuda_d3d11.c) and driver resources. */
+static CUresult map_resources(unsigned int count, CUgraphicsResource *resources, CUstream hStream, BOOL map, BOOL ptsz)
+{
+    CUgraphicsResource driver_resources[64], *driver = driver_resources;
+    unsigned int i, driver_count = 0, done = 0;
+    CUresult ret = CUDA_SUCCESS;
+
+    if (count > ARRAY_SIZE(driver_resources) && !(driver = malloc(count * sizeof(*driver))))
+        return CUDA_ERROR_OUT_OF_MEMORY;
+
+    for (i = 0; i < count; i++)
+        if (!d3d11_is_resource(resources[i])) driver[driver_count++] = resources[i];
+
+    if (driver_count)
+    {
+        if (map) ret = ptsz ? pcuGraphicsMapResources_ptsz(driver_count, driver, hStream)
+                            : pcuGraphicsMapResources(driver_count, driver, hStream);
+        else ret = ptsz ? pcuGraphicsUnmapResources_ptsz(driver_count, driver, hStream)
+                        : pcuGraphicsUnmapResources(driver_count, driver, hStream);
+    }
+
+    for (i = 0; !ret && i < count; i++)
+    {
+        if (!d3d11_is_resource(resources[i])) continue;
+        ret = map ? d3d11_map_resource(resources[i], hStream, ptsz) : d3d11_unmap_resource(resources[i], hStream, ptsz);
+        if (!ret) done++;
+    }
+
+    /* A failed map leaves nothing mapped, as with the driver. */
+    if (ret && map)
+    {
+        for (i = 0; done && i < count; i++)
+            if (d3d11_is_resource(resources[i]) && !d3d11_unmap_resource(resources[i], hStream, ptsz)) done--;
+        if (driver_count)
+            ptsz ? pcuGraphicsUnmapResources_ptsz(driver_count, driver, hStream)
+                 : pcuGraphicsUnmapResources(driver_count, driver, hStream);
+    }
+
+    if (driver != driver_resources) free(driver);
+    return ret;
+}
+
 CUresult WINAPI wine_cuGraphicsMapResources(unsigned int count, CUgraphicsResource *resources, CUstream hStream)
 {
     TRACE("(%u, %p, %p)\n", count, resources, hStream);
-    return pcuGraphicsMapResources(count, resources, hStream);
+    return map_resources(count, resources, hStream, TRUE, FALSE);
 }
 
 CUresult WINAPI wine_cuGraphicsResourceGetMappedMipmappedArray(CUmipmappedArray *pMipmappedArray, CUgraphicsResource resource)
 {
     TRACE("(%p, %p)\n", pMipmappedArray, resource);
+    if (d3d11_is_resource(resource)) return d3d11_not_an_array(resource);
     return pcuGraphicsResourceGetMappedMipmappedArray(pMipmappedArray, resource);
 }
 
 CUresult WINAPI wine_cuGraphicsResourceGetMappedPointer(CUdeviceptr_v1 *pDevPtr, unsigned int *pSize, CUgraphicsResource resource)
 {
     TRACE("(%p, %p, %p)\n", pDevPtr, pSize, resource);
+    if (d3d11_is_resource(resource)) return CUDA_ERROR_NOT_SUPPORTED;
     return pcuGraphicsResourceGetMappedPointer(pDevPtr, pSize, resource);
 }
 
 CUresult WINAPI wine_cuGraphicsResourceGetMappedPointer_v2(CUdeviceptr *pDevPtr, size_t *pSize, CUgraphicsResource resource)
 {
     TRACE("(%p, %p, %p)\n", pDevPtr, pSize, resource);
+    if (d3d11_is_resource(resource)) return d3d11_get_mapped_pointer(pDevPtr, pSize, resource);
     return pcuGraphicsResourceGetMappedPointer_v2(pDevPtr, pSize, resource);
 }
 
 CUresult WINAPI wine_cuGraphicsResourceSetMapFlags(CUgraphicsResource resource, unsigned int flags)
 {
     TRACE("(%p, %u)\n", resource, flags);
+    if (d3d11_is_resource(resource)) return d3d11_set_map_flags(resource, flags);
     return pcuGraphicsResourceSetMapFlags(resource, flags);
 }
 
@@ -2135,18 +2181,20 @@ CUresult WINAPI wine_cuGraphicsSubResourceGetMappedArray(CUarray *pArray, CUgrap
                                                          unsigned int arrayIndex, unsigned int mipLevel)
 {
     TRACE("(%p, %p, %u, %u)\n", pArray, resource, arrayIndex, mipLevel);
+    if (d3d11_is_resource(resource)) return d3d11_not_an_array(resource);
     return pcuGraphicsSubResourceGetMappedArray(pArray, resource, arrayIndex, mipLevel);
 }
 
 CUresult WINAPI wine_cuGraphicsUnmapResources(unsigned int count, CUgraphicsResource *resources, CUstream hStream)
 {
     TRACE("(%u, %p, %p)\n", count, resources, hStream);
-    return pcuGraphicsUnmapResources(count, resources, hStream);
+    return map_resources(count, resources, hStream, FALSE, FALSE);
 }
 
 CUresult WINAPI wine_cuGraphicsUnregisterResource(CUgraphicsResource resource)
 {
     TRACE("(%p)\n", resource);
+    if (d3d11_is_resource(resource)) return d3d11_unregister_resource(resource);
     return pcuGraphicsUnregisterResource(resource);
 }
 
@@ -3527,6 +3575,7 @@ CUresult WINAPI wine_cuGLGetDevices_v2(unsigned int *pCudaDeviceCount, CUdevice 
 CUresult WINAPI wine_cuGraphicsResourceSetMapFlags_v2(CUgraphicsResource resource, unsigned int flags)
 {
     TRACE("(%p, %u)\n", resource, flags);
+    if (d3d11_is_resource(resource)) return d3d11_set_map_flags(resource, flags);
     return pcuGraphicsResourceSetMapFlags_v2(resource, flags);
 }
 
@@ -3630,13 +3679,13 @@ CUresult WINAPI wine_cuGLMapBufferObject_v2_ptds(CUdeviceptr *dptr, size_t *size
 CUresult WINAPI wine_cuGraphicsMapResources_ptsz(unsigned int count, CUgraphicsResource *resources, CUstream hStream)
 {
     TRACE("(%u, %p, %p)\n", count, resources, hStream);
-    return pcuGraphicsMapResources_ptsz(count, resources, hStream);
+    return map_resources(count, resources, hStream, TRUE, TRUE);
 }
 
 CUresult WINAPI wine_cuGraphicsUnmapResources_ptsz(unsigned int count, CUgraphicsResource *resources, CUstream hStream)
 {
     TRACE("(%u, %p, %p)\n", count, resources, hStream);
-    return pcuGraphicsUnmapResources_ptsz(count, resources, hStream);
+    return map_resources(count, resources, hStream, FALSE, TRUE);
 }
 
 CUresult WINAPI wine_cuLaunchKernel_ptsz(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
@@ -4373,25 +4422,6 @@ CUresult WINAPI wine_cuDestroyExternalMemory(void *extMem)
     return pcuDestroyExternalMemory(extMem);
 }
 
-static pthread_mutex_t semMutex = PTHREAD_MUTEX_INITIALIZER;
-static int semCounter = 0;
-static CUexternalSemaphore semList[4] = {0};
-
-static void semaphoreHandling(CUexternalSemaphore *extSem_out)
-{
-    pthread_mutex_lock(&semMutex);
-    if(semCounter >= 4) semCounter = 0;
-    if(semList[semCounter])
-    {
-        CUresult ret = pcuDestroyExternalSemaphore(semList[semCounter]);
-        if(ret) FIXME("Failed to destroy semaphore: %p: %d\n", semList[semCounter], ret);
-    }
-
-    semList[semCounter] = *extSem_out;
-    semCounter++;
-    pthread_mutex_unlock(&semMutex);
-}
-
 CUresult WINAPI wine_cuImportExternalSemaphore(CUexternalSemaphore *extSem_out, const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC *semHandleDesc)
 {
     TRACE("(%p, %p, %d)\n", extSem_out, semHandleDesc, semHandleDesc->type);
@@ -4414,13 +4444,21 @@ CUresult WINAPI wine_cuImportExternalSemaphore(CUexternalSemaphore *extSem_out, 
             linuxHandleDesc.handle.fd = get_shared_resource_fd(linuxHandleDesc.handle.win32.handle);
             linuxHandleDesc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD;
             break;
+        /* Under Wine a D3D11 or D3D12 fence is a Vulkan timeline semaphore (DXVK, vkd3d-proton),
+         * and its NT handle leads to that semaphore's opaque fd. The signal and wait parameters
+         * use the same 64-bit fence value as a timeline semaphore. */
+        case CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE:
+        case CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE:
+            linuxHandleDesc.handle.fd = get_d3dkmt_object_fd(linuxHandleDesc.handle.win32.handle, TRUE);
+            linuxHandleDesc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD;
+            linuxHandleDesc.flags = 0;
+            break;
         default:
             break;
     }
 
     CUresult ret = pcuImportExternalSemaphore(extSem_out, &linuxHandleDesc);
-    if(!ret) semaphoreHandling(extSem_out);
-    else ERR("Returned error: %d\n", ret);
+    if(ret) ERR("Returned error: %d\n", ret);
 
     return ret;
 }
@@ -6779,13 +6817,8 @@ CUresult WINAPI wine_cuD3D11GetDevice(CUdevice *pCudaDevice, IDXGIAdapter *pAdap
 
 CUresult WINAPI wine_cuGraphicsD3D11RegisterResource(CUgraphicsResource *pCudaResource, ID3D11Resource *pD3DResource, unsigned int Flags)
 {
-    FIXME("(%p, %p, %u) - semi-stub\n", pCudaResource, pD3DResource, Flags);
-    /* Not able to handle spesific flags at this time */
-    if(Flags > 0)
-      return CUDA_ERROR_INVALID_VALUE;
-
-    /* pD3DResource is unknown at this time and cannot be "registered" */
-    return CUDA_ERROR_UNKNOWN;
+    TRACE("(%p, %p, %u)\n", pCudaResource, pD3DResource, Flags);
+    return d3d11_register_resource(pCudaResource, (struct ID3D11Resource *)pD3DResource, Flags);
 }
 
 CUresult WINAPI wine_cuD3D11CtxCreate(CUcontext* pCtx, CUdevice* pCudaDevice, unsigned int Flags, ID3D11Device* pD3DDevice)
