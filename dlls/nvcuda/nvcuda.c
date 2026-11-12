@@ -66,6 +66,9 @@ struct stream_callback_entry
     void (WINAPI *callback)(CUstream hStream, CUresult status, void *userData);
     /* Set instead of callback for cuLaunchHostFunc. */
     void (WINAPI *hostfn)(void *userData);
+    /* One run of a host function captured into a graph. The graph's own reference keeps the
+     * worker thread alive, so running this one does not count down num_stream_callbacks. */
+    BOOL graph_run;
     struct
     {
         CUstream stream;
@@ -1594,7 +1597,7 @@ static BOOL load_functions(void)
     TRY_LOAD_FUNCPTR(cuCoredumpDeregisterStartCallback);
     TRY_LOAD_FUNCPTR(cuCoredumpDeregisterCompleteCallback);
     TRY_LOAD_FUNCPTR(cuLaunchHostFunc_v2);
-    TRY_LOAD_FUNCPTR(cuLaunchHostFunc_v2);
+    TRY_LOAD_FUNCPTR(cuLaunchHostFunc_v2_ptsz);
     TRY_LOAD_FUNCPTR(cuLogicalEndpointIdReserve);
     TRY_LOAD_FUNCPTR(cuLogicalEndpointIdRelease);
     TRY_LOAD_FUNCPTR(cuLogicalEndpointCreate);
@@ -2883,6 +2886,7 @@ static DWORD WINAPI stream_callback_worker_thread(LPVOID parameter)
 {
     struct stream_callback_entry *wrapper;
     struct list *ptr;
+    BOOL graph_run;
     pthread_mutex_lock(&stream_callback_mutex);
 
     for (;;)
@@ -2891,6 +2895,7 @@ static DWORD WINAPI stream_callback_worker_thread(LPVOID parameter)
         {
             wrapper = LIST_ENTRY(ptr, struct stream_callback_entry, entry);
             list_remove(&wrapper->entry);
+            graph_run = FALSE;
 
             switch (wrapper->status)
             {
@@ -2899,6 +2904,7 @@ static DWORD WINAPI stream_callback_worker_thread(LPVOID parameter)
                     break;
 
                 case STREAM_CALLBACK_PENDING:
+                    graph_run = wrapper->graph_run;
                     pthread_mutex_unlock(&stream_callback_mutex);
 
                     if (wrapper->hostfn)
@@ -2924,10 +2930,13 @@ static DWORD WINAPI stream_callback_worker_thread(LPVOID parameter)
                     assert(0); /* never reached */
             }
 
-            if (!--num_stream_callbacks)
+            if (!graph_run && !--num_stream_callbacks)
                 goto end;
         }
 
+        /* The last graph reference can go while this thread waits. */
+        if (!num_stream_callbacks)
+            goto end;
         pthread_cond_wait(&stream_callback_request, &stream_callback_mutex);
     }
 
@@ -3039,6 +3048,8 @@ struct launch_host_func_args
 {
     CUresult (*func)(CUstream, CUhostFn, void *);
     CUresult (*func_v2)(CUstream, CUhostFn, void *, unsigned int);
+    CUresult (*get_capture_info)(CUstream, CUstreamCaptureStatus *, cuuint64_t *, CUgraph *,
+                                 const CUgraphNode **, size_t *);
     CUstream stream;
     unsigned int sync_mode;
 };
@@ -3051,11 +3062,116 @@ static CUresult launch_host_fn(struct stream_callback_entry *wrapper, void *cont
     return args->func(args->stream, host_fn_wrapper, wrapper);
 }
 
+/* A host function launched while its stream is captured becomes a graph node, which the driver
+ * runs once per launch of the graph, possibly from several streams at once. The node gets this
+ * record, which lives until the driver destroys the last graph holding it. */
+struct captured_host_fn
+{
+    void (WINAPI *hostfn)(void *userData);
+    void *userdata;
+};
+
+/* Runs on a driver thread, once per graph launch. */
+static void captured_host_fn_wrapper(void *userData)
+{
+    struct captured_host_fn *captured = userData;
+    struct stream_callback_entry *wrapper = calloc(1, sizeof(*wrapper));
+
+    if (!wrapper)
+    {
+        ERR("out of memory, host function %p(%p) not called\n", captured->hostfn, captured->userdata);
+        return;
+    }
+    wrapper->hostfn         = captured->hostfn;
+    wrapper->args.userdata  = captured->userdata;
+    wrapper->graph_run      = TRUE;
+    run_on_callback_worker(wrapper);
+}
+
+/* Takes one reference on the worker thread, starting it if none runs. */
+static CUresult acquire_callback_worker(void)
+{
+    pthread_mutex_lock(&stream_callback_mutex);
+    if (!num_stream_callbacks++)
+    {
+        HANDLE thread = CreateThread(NULL, 0, stream_callback_worker_thread, NULL, 0, NULL);
+        if (!thread)
+        {
+            num_stream_callbacks--;
+            pthread_mutex_unlock(&stream_callback_mutex);
+            return CUDA_ERROR_OUT_OF_MEMORY;
+        }
+        CloseHandle(thread);
+    }
+    pthread_mutex_unlock(&stream_callback_mutex);
+    return CUDA_SUCCESS;
+}
+
+/* Drops a reference from acquire_callback_worker; the thread ends with the last one. Called on a
+ * driver thread when a graph is destroyed, so it uses no Wine thread state. */
+static void release_callback_worker(void)
+{
+    pthread_mutex_lock(&stream_callback_mutex);
+    if (!--num_stream_callbacks)
+        pthread_cond_signal(&stream_callback_request);
+    pthread_mutex_unlock(&stream_callback_mutex);
+}
+
+/* The destructor of the user object that ties a captured host function to its graphs. */
+static void captured_host_fn_release(void *userData)
+{
+    free(userData);
+    release_callback_worker();
+}
+
+static CUresult launch_captured_host_func(struct launch_host_func_args *args, CUgraph graph,
+                                          void *fn, void *userData)
+{
+    struct captured_host_fn *captured;
+    void *object;
+    CUresult ret;
+
+    if (!(captured = calloc(1, sizeof(*captured))))
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    captured->hostfn   = fn;
+    captured->userdata = userData;
+    if ((ret = acquire_callback_worker()))
+    {
+        free(captured);
+        return ret;
+    }
+    /* From here the user object owns the record and the worker reference. */
+    if ((ret = pcuUserObjectCreate(&object, captured, captured_host_fn_release, 1,
+                                   CU_USER_OBJECT_NO_DESTRUCTOR_SYNC)))
+    {
+        captured_host_fn_release(captured);
+        return ret;
+    }
+    if ((ret = pcuGraphRetainUserObject(graph, object, 1, CU_GRAPH_USER_OBJECT_MOVE)))
+    {
+        pcuUserObjectRelease(object, 1);
+        return ret;
+    }
+    /* If the launch fails, the graph still frees the record when it is destroyed. */
+    if (args->func_v2)
+        return args->func_v2(args->stream, captured_host_fn_wrapper, captured, args->sync_mode);
+    return args->func(args->stream, captured_host_fn_wrapper, captured);
+}
+
 /* The driver calls a host function on a thread of its own, so the Windows function goes through
  * the callback worker, as for cuStreamAddCallback. */
 static CUresult launch_host_func(struct launch_host_func_args *args, void *fn, void *userData)
 {
     struct stream_callback_entry *wrapper;
+    CUstreamCaptureStatus status = CU_STREAM_CAPTURE_STATUS_NONE;
+    CUgraph graph = NULL;
+
+    /* The trampoline the driver gets is never null, so check the caller's function here. */
+    if (!fn)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (!args->get_capture_info(args->stream, &status, NULL, &graph, NULL, NULL) &&
+        status == CU_STREAM_CAPTURE_STATUS_ACTIVE)
+        return launch_captured_host_func(args, graph, fn, userData);
 
     wrapper = calloc(1, sizeof(*wrapper));
     if (!wrapper)
@@ -4199,14 +4315,14 @@ CUresult WINAPI wine_cuMemGetAllocationGranularity(size_t *granularity, const CU
 
 CUresult WINAPI wine_cuLaunchHostFunc(CUstream hStream, CUhostFn fn, void *userData)
 {
-    struct launch_host_func_args args = { pcuLaunchHostFunc, NULL, hStream, 0 };
+    struct launch_host_func_args args = { pcuLaunchHostFunc, NULL, pcuStreamGetCaptureInfo_v2, hStream, 0 };
     TRACE("(%p, %p, %p)\n", hStream, fn, userData);
     return launch_host_func(&args, fn, userData);
 }
 
 CUresult WINAPI wine_cuLaunchHostFunc_ptsz(CUstream hStream, CUhostFn fn, void *userData)
 {
-    struct launch_host_func_args args = { pcuLaunchHostFunc_ptsz, NULL, hStream, 0 };
+    struct launch_host_func_args args = { pcuLaunchHostFunc_ptsz, NULL, pcuStreamGetCaptureInfo_v2_ptsz, hStream, 0 };
     TRACE("(%p, %p, %p)\n", hStream, fn, userData);
     return launch_host_func(&args, fn, userData);
 }
@@ -6382,7 +6498,7 @@ CUresult WINAPI wine_cuCoredumpDeregisterCompleteCallback(CUcoredumpCallbackHand
 CUresult WINAPI wine_cuLaunchHostFunc_v2(CUstream hStream, CUhostFn fn, void* userData, unsigned int syncMode)
 {
     TRACE("(%p, %p, %p, %u)\n", hStream, fn, userData, syncMode);
-    struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2, hStream, syncMode };
+    struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2, pcuStreamGetCaptureInfo_v2, hStream, syncMode };
     CHECK_FUNCPTR(cuLaunchHostFunc_v2);
     return launch_host_func(&args, fn, userData);
 }
@@ -6390,7 +6506,7 @@ CUresult WINAPI wine_cuLaunchHostFunc_v2(CUstream hStream, CUhostFn fn, void* us
 CUresult WINAPI wine_cuLaunchHostFunc_v2_ptsz(CUstream hStream, CUhostFn fn, void* userData, unsigned int syncMode)
 {
     TRACE("(%p, %p, %p, %u)\n", hStream, fn, userData, syncMode);
-    struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2_ptsz, hStream, syncMode };
+    struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2_ptsz, pcuStreamGetCaptureInfo_v2_ptsz, hStream, syncMode };
     CHECK_FUNCPTR(cuLaunchHostFunc_v2_ptsz);
     return launch_host_func(&args, fn, userData);
 }

@@ -74,6 +74,10 @@ typedef int CUresourcetype;
 typedef int CUresult;
 typedef int CUsharedconfig;
 typedef int CUstreamCaptureStatus;
+#define CU_STREAM_CAPTURE_STATUS_NONE    0
+#define CU_STREAM_CAPTURE_STATUS_ACTIVE  1
+#define CU_USER_OBJECT_NO_DESTRUCTOR_SYNC 1
+#define CU_GRAPH_USER_OBJECT_MOVE         1
 typedef int CUstreamCaptureMode;
 typedef int CUgraphMem_attribute;
 typedef int CUmemPool_attribute;
