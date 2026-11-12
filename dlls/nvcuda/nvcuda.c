@@ -2138,16 +2138,18 @@ static CUresult map_resources(unsigned int count, CUgraphicsResource *resources,
     for (i = 0; !ret && i < count; i++)
     {
         if (!d3d11_is_resource(resources[i])) continue;
-        ret = map ? d3d11_map_resource(resources[i], hStream, ptsz) : d3d11_unmap_resource(resources[i], hStream, ptsz);
+        ret = map ? d3d11_map_resource(resources[i], hStream, ptsz) : d3d11_unmap_resource(resources[i], hStream, ptsz, TRUE);
         done[i] = !ret;
     }
 
     /* A failed map leaves nothing mapped that this call mapped, as with the driver. A resource
-     * that was mapped before the call (CUDA_ERROR_ALREADY_MAPPED) stays mapped. */
+     * that was mapped before the call (CUDA_ERROR_ALREADY_MAPPED) stays mapped. The undo does
+     * not copy the twin back: nothing has written to it, and after a WRITE_DISCARD map it holds
+     * stale bytes. The same resource twice in the array fails this way on its second entry. */
     if (ret && map)
     {
         for (i = 0; i < count; i++)
-            if (done[i]) d3d11_unmap_resource(resources[i], hStream, ptsz);
+            if (done[i]) d3d11_unmap_resource(resources[i], hStream, ptsz, FALSE);
         if (driver_done)
             ptsz ? pcuGraphicsUnmapResources_ptsz(driver_count, driver, hStream)
                  : pcuGraphicsUnmapResources(driver_count, driver, hStream);

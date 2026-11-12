@@ -35,7 +35,7 @@ CUresult __attribute((visibility("hidden"))) d3d11_register_resource(CUgraphicsR
 BOOL __attribute((visibility("hidden"))) d3d11_is_resource(CUgraphicsResource handle);
 CUresult __attribute((visibility("hidden"))) d3d11_unregister_resource(CUgraphicsResource handle);
 CUresult __attribute((visibility("hidden"))) d3d11_map_resource(CUgraphicsResource handle, CUstream stream, BOOL ptsz);
-CUresult __attribute((visibility("hidden"))) d3d11_unmap_resource(CUgraphicsResource handle, CUstream stream, BOOL ptsz);
+CUresult __attribute((visibility("hidden"))) d3d11_unmap_resource(CUgraphicsResource handle, CUstream stream, BOOL ptsz, BOOL copy_back);
 CUresult __attribute((visibility("hidden"))) d3d11_get_mapped_pointer(CUdeviceptr *pointer, size_t *size, CUgraphicsResource handle);
 CUresult __attribute((visibility("hidden"))) d3d11_set_map_flags(CUgraphicsResource handle, unsigned int flags);
 CUresult __attribute((visibility("hidden"))) d3d11_not_an_array(CUgraphicsResource handle);

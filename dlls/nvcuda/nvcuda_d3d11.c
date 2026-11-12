@@ -441,7 +441,9 @@ CUresult d3d11_map_resource(CUgraphicsResource handle, CUstream stream, BOOL pts
     return ret;
 }
 
-CUresult d3d11_unmap_resource(CUgraphicsResource handle, CUstream stream, BOOL ptsz)
+/* With copy_back FALSE the D3D11 buffer keeps its contents: the rollback of a failed map uses
+ * that, because after a WRITE_DISCARD map the twin holds stale bytes. */
+CUresult d3d11_unmap_resource(CUgraphicsResource handle, CUstream stream, BOOL ptsz, BOOL copy_back)
 {
     CUDA_EXTERNAL_SEMAPHORE_PARAMS_ params = {0};
     struct d3d11_cuda_resource *resource;
@@ -486,7 +488,7 @@ CUresult d3d11_unmap_resource(CUgraphicsResource handle, CUstream stream, BOOL p
         }
         if (event) CloseHandle(event);
     }
-    if (!ret && !(resource->map_flags & CU_GRAPHICS_MAP_RESOURCE_FLAGS_READ_ONLY))
+    if (!ret && copy_back && !(resource->map_flags & CU_GRAPHICS_MAP_RESOURCE_FLAGS_READ_ONLY))
         copy_buffer(resource, resource->buffer, resource->twin);
     ID3D11DeviceContext4_Flush(resource->context);
     unlock_context(resource);
