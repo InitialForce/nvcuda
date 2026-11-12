@@ -2108,12 +2108,17 @@ static CUresult map_resources(unsigned int count, CUgraphicsResource *resources,
 {
     CUgraphicsResource driver_resources[64], *driver = driver_resources;
     BOOL done_flags[64], *done = done_flags;
-    unsigned int i, driver_count = 0;
+    unsigned int i, j, driver_count = 0;
     CUresult ret = CUDA_SUCCESS;
     BOOL driver_done;
 
     if (!count) return CUDA_SUCCESS;
     if (!resources) return CUDA_ERROR_INVALID_VALUE;
+    /* As in the CUDA documentation for both calls: a duplicate entry fails the whole call before
+     * any resource is touched. */
+    for (i = 0; i < count; i++)
+        for (j = i + 1; j < count; j++)
+            if (resources[i] == resources[j]) return CUDA_ERROR_INVALID_HANDLE;
     if (count > ARRAY_SIZE(driver_resources)
         && (!(driver = malloc(count * sizeof(*driver))) || !(done = calloc(count, sizeof(*done)))))
     {
@@ -2145,7 +2150,7 @@ static CUresult map_resources(unsigned int count, CUgraphicsResource *resources,
     /* A failed map leaves nothing mapped that this call mapped, as with the driver. A resource
      * that was mapped before the call (CUDA_ERROR_ALREADY_MAPPED) stays mapped. The undo does
      * not copy the twin back: nothing has written to it, and after a WRITE_DISCARD map it holds
-     * stale bytes. The same resource twice in the array fails this way on its second entry. */
+     * stale bytes. */
     if (ret && map)
     {
         for (i = 0; i < count; i++)

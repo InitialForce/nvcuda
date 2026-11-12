@@ -56,6 +56,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(nvcuda);
 
 #define CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY     0x1
 #define CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD 0x2
+#define CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE          0x0
 #define CU_GRAPHICS_MAP_RESOURCE_FLAGS_READ_ONLY     0x1
 #define CU_GRAPHICS_MAP_RESOURCE_FLAGS_WRITE_DISCARD 0x2
 
@@ -522,6 +523,9 @@ CUresult d3d11_set_map_flags(CUgraphicsResource handle, unsigned int flags)
     EnterCriticalSection(&resources_cs);
     if (!(resource = find_resource(handle))) ret = CUDA_ERROR_INVALID_HANDLE;
     else if (resource->mapped) ret = CUDA_ERROR_ALREADY_MAPPED_;
+    else if (flags != CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE && flags != CU_GRAPHICS_MAP_RESOURCE_FLAGS_READ_ONLY
+             && flags != CU_GRAPHICS_MAP_RESOURCE_FLAGS_WRITE_DISCARD)
+        ret = CUDA_ERROR_INVALID_VALUE;
     else resource->map_flags = flags;
     LeaveCriticalSection(&resources_cs);
     return ret;
