@@ -2921,9 +2921,11 @@ static DWORD WINAPI stream_callback_worker_thread(LPVOID parameter)
                         TRACE("stream callback %p returned\n", wrapper->callback);
                     }
 
+                    /* Under the lock, since the waiter may return, and free or leave the
+                     * frame holding the entry, as soon as it sees the status. */
+                    pthread_mutex_lock(&stream_callback_mutex);
                     wrapper->status = STREAM_CALLBACK_EXECUTED;
                     pthread_cond_broadcast(&stream_callback_reply);
-                    pthread_mutex_lock(&stream_callback_mutex);
                     break;
 
                 default:
@@ -2946,7 +2948,7 @@ end:
 }
 
 /* Runs on a thread of the Linux driver, which has no Wine thread state, so the Windows callback
- * runs on the worker thread instead and this waits for it. */
+ * runs on the worker thread instead and this waits for it. The caller owns the entry. */
 static void run_on_callback_worker(struct stream_callback_entry *wrapper)
 {
     wrapper->status = STREAM_CALLBACK_PENDING;
@@ -2958,7 +2960,6 @@ static void run_on_callback_worker(struct stream_callback_entry *wrapper)
         pthread_cond_wait(&stream_callback_reply, &stream_callback_mutex);
 
     pthread_mutex_unlock(&stream_callback_mutex);
-    free(wrapper);
 }
 
 static void stream_callback_wrapper(CUstream hStream, CUresult status, void *userData)
@@ -2967,11 +2968,13 @@ static void stream_callback_wrapper(CUstream hStream, CUresult status, void *use
     wrapper->args.stream = hStream;
     wrapper->args.status = status;
     run_on_callback_worker(wrapper);
+    free(wrapper);
 }
 
 static void host_fn_wrapper(void *userData)
 {
     run_on_callback_worker(userData);
+    free(userData);
 }
 
 /* Queues one callback for the worker thread, starting the thread if none runs. launch hands the
@@ -3071,21 +3074,19 @@ struct captured_host_fn
     void *userdata;
 };
 
-/* Runs on a driver thread, once per graph launch. */
+/* Runs on a driver thread, once per graph launch. The queue entry lives on this stack, since
+ * this returns only after the worker has run the function, so nothing is allocated while the
+ * graph runs. */
 static void captured_host_fn_wrapper(void *userData)
 {
     struct captured_host_fn *captured = userData;
-    struct stream_callback_entry *wrapper = calloc(1, sizeof(*wrapper));
+    struct stream_callback_entry wrapper;
 
-    if (!wrapper)
-    {
-        ERR("out of memory, host function %p(%p) not called\n", captured->hostfn, captured->userdata);
-        return;
-    }
-    wrapper->hostfn         = captured->hostfn;
-    wrapper->args.userdata  = captured->userdata;
-    wrapper->graph_run      = TRUE;
-    run_on_callback_worker(wrapper);
+    memset(&wrapper, 0, sizeof(wrapper));
+    wrapper.hostfn         = captured->hostfn;
+    wrapper.args.userdata  = captured->userdata;
+    wrapper.graph_run      = TRUE;
+    run_on_callback_worker(&wrapper);
 }
 
 /* Takes one reference on the worker thread, starting it if none runs. */
@@ -6499,6 +6500,9 @@ CUresult WINAPI wine_cuLaunchHostFunc_v2(CUstream hStream, CUhostFn fn, void* us
 {
     TRACE("(%p, %p, %p, %u)\n", hStream, fn, userData, syncMode);
     struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2, pcuStreamGetCaptureInfo_v2, hStream, syncMode };
+    /* Before CHECK_FUNCPTR, so a null function gets the same answer on every driver. */
+    if (!fn)
+        return CUDA_ERROR_INVALID_VALUE;
     CHECK_FUNCPTR(cuLaunchHostFunc_v2);
     return launch_host_func(&args, fn, userData);
 }
@@ -6507,6 +6511,9 @@ CUresult WINAPI wine_cuLaunchHostFunc_v2_ptsz(CUstream hStream, CUhostFn fn, voi
 {
     TRACE("(%p, %p, %p, %u)\n", hStream, fn, userData, syncMode);
     struct launch_host_func_args args = { NULL, pcuLaunchHostFunc_v2_ptsz, pcuStreamGetCaptureInfo_v2_ptsz, hStream, syncMode };
+    /* Before CHECK_FUNCPTR, so a null function gets the same answer on every driver. */
+    if (!fn)
+        return CUDA_ERROR_INVALID_VALUE;
     CHECK_FUNCPTR(cuLaunchHostFunc_v2_ptsz);
     return launch_host_func(&args, fn, userData);
 }
